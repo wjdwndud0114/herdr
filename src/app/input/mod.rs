@@ -97,6 +97,10 @@ pub(crate) enum ClientSidebarAction {
 
 pub(crate) enum ClientSidebarInput {
     Forward,
+    /// The prefix was already forwarded to the active content server, but the
+    /// follow-up key belongs to the aggregate fleet shell. Cancel the server's
+    /// pending prefix before applying the local action.
+    CancelServerPrefix(Option<ClientSidebarAction>),
     Consumed(Option<ClientSidebarAction>),
 }
 
@@ -340,18 +344,35 @@ pub(crate) fn handle_client_sidebar_key(
             None
         }
         Mode::Prefix => {
+            if key.kind != crossterm::event::KeyEventKind::Press
+                || matches!(key_event.code, KeyCode::Modifier(_))
+            {
+                return ClientSidebarInput::Forward;
+            }
             let action = handle_client_sidebar_action_key(state, &key, true);
+            let handled = action.is_some() || state.mode != Mode::Prefix;
             if state.mode == Mode::Prefix {
                 state.mode = Mode::Terminal;
             }
-            action
+            if handled {
+                return ClientSidebarInput::CancelServerPrefix(
+                    take_client_sidebar_request(state).or(action),
+                );
+            }
+            return ClientSidebarInput::Forward;
         }
         Mode::Terminal => {
+            if key.kind != crossterm::event::KeyEventKind::Press {
+                return ClientSidebarInput::Forward;
+            }
             let normalized = crate::config::normalize_key_combo((key.code, key.modifiers));
             let prefix = crate::config::normalize_key_combo((state.prefix_code, state.prefix_mods));
             if normalized == prefix {
                 state.mode = Mode::Prefix;
-                return ClientSidebarInput::Consumed(None);
+                // Let the active server enter its native Prefix mode. Fleet
+                // keeps a shadow Prefix mode only so aggregate workspace and
+                // sidebar actions can be intercepted on the next key.
+                return ClientSidebarInput::Forward;
             }
             let action = handle_client_sidebar_action_key(state, &key, false);
             if action.is_none() && state.mode == Mode::Terminal {
