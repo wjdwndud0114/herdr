@@ -1584,6 +1584,7 @@ pub(super) fn client_action_runs_on_active_content(action: NavigateAction) -> bo
             | NavigateAction::CyclePaneNext
             | NavigateAction::CyclePanePrevious
             | NavigateAction::LastPane
+            | NavigateAction::OpenNotificationTarget
     )
 }
 
