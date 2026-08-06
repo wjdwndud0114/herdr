@@ -245,7 +245,9 @@ impl Workspace {
         public_pane_numbers.insert(root_id, 1);
 
         for (idx, (terminal_id, seen)) in pane_terminals.into_iter().enumerate().skip(1) {
-            let pane_id = layout.split_focused(Direction::Vertical);
+            let Some(pane_id) = layout.split_pane(root_id, Direction::Vertical, 0.5) else {
+                continue;
+            };
             let mut pane = PaneState::new(terminal_id);
             pane.seen = seen;
             panes.insert(pane_id, pane);
