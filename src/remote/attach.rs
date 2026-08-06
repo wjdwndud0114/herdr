@@ -1647,6 +1647,7 @@ enum RemoteBridgeEndpoint {
     Api,
 }
 
+#[cfg(test)]
 fn remote_bridge_command(remote_herdr: &RemoteHerdr, session_name: &str) -> String {
     remote_endpoint_bridge_command(remote_herdr, session_name, RemoteBridgeEndpoint::Client)
 }
