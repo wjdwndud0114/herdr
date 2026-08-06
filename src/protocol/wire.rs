@@ -594,8 +594,7 @@ impl FrameData {
     /// Reconstructs a ratatui `Buffer` from this frame data.
     ///
     /// Returns `None` if the cells vector length doesn't match `width * height`.
-    #[cfg(test)]
-    pub fn to_ratatui_buffer(&self) -> Option<ratatui::buffer::Buffer> {
+    pub(crate) fn to_ratatui_buffer(&self) -> Option<ratatui::buffer::Buffer> {
         let expected = (self.width as usize) * (self.height as usize);
         if self.cells.len() != expected {
             return None;
@@ -762,7 +761,6 @@ pub(crate) fn color_to_u32(color: ratatui::style::Color) -> u32 {
 }
 
 /// Converts a packed u32 back to a ratatui `Color`.
-#[cfg(test)]
 fn u32_to_color(val: u32) -> ratatui::style::Color {
     match val >> 24 {
         0x00 => match val & 0xFF {
@@ -817,7 +815,6 @@ pub(crate) fn modifier_with_underline_style(
 }
 
 /// Converts a u16 back to a ratatui `Modifier`.
-#[cfg(test)]
 fn u16_to_modifier(val: u16) -> ratatui::style::Modifier {
     ratatui::style::Modifier::from_bits_truncate(val & !UNDERLINE_STYLE_MASK)
 }
