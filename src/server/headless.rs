@@ -3018,6 +3018,7 @@ impl HeadlessServer {
                 render_encoding,
                 direct_attach_requested,
                 direct_graphics,
+                app_surface,
             } => {
                 if self.handoff_in_progress {
                     if let Ok(message) =
@@ -3060,6 +3061,7 @@ impl HeadlessServer {
                 );
                 connection.direct_graphics = direct_graphics;
                 connection.pixel_mouse = direct_graphics;
+                connection.app_surface = app_surface;
                 self.clients.insert(client_id, connection);
                 if !direct_attach_requested {
                     self.foreground_client_id = Some(client_id);
@@ -6263,6 +6265,7 @@ new_tab = "prefix+t"
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
             direct_graphics: false,
+            app_surface: crate::protocol::AppSurface::Full,
             writer: writer_a,
         }));
         assert_eq!(
@@ -6288,6 +6291,7 @@ new_tab = "prefix+t"
             keybindings: None,
             direct_attach_requested: false,
             direct_graphics: false,
+            app_surface: crate::protocol::AppSurface::Full,
             writer: writer_b,
         }));
         assert_eq!(
@@ -6329,6 +6333,7 @@ new_tab = "prefix+t"
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
             direct_graphics: false,
+            app_surface: crate::protocol::AppSurface::Full,
             writer: writer_a,
         }));
         assert_eq!(server.app.state.config_diagnostic, without_keybindings);
@@ -6343,6 +6348,7 @@ new_tab = "prefix+t"
             keybindings: None,
             direct_attach_requested: false,
             direct_graphics: false,
+            app_surface: crate::protocol::AppSurface::Full,
             writer: writer_b,
         }));
         assert_eq!(
@@ -6387,6 +6393,7 @@ next_tab = ""
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
             direct_graphics: false,
+            app_surface: crate::protocol::AppSurface::Full,
             writer,
         }));
         server.app.state.mode = crate::app::Mode::Settings;
@@ -6463,6 +6470,7 @@ next_tab = ""
             keybindings: Some(Box::new(local_config.live_keybinds().unwrap())),
             direct_attach_requested: false,
             direct_graphics: false,
+            app_surface: crate::protocol::AppSurface::Full,
             writer: writer_a,
         }));
         server.app.state.mode = crate::app::Mode::Settings;
@@ -6484,6 +6492,7 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: false,
             direct_graphics: false,
+            app_surface: crate::protocol::AppSurface::Full,
             writer: writer_b,
         }));
         assert_eq!(
@@ -6519,6 +6528,7 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: true,
             direct_graphics: false,
+            app_surface: crate::protocol::AppSurface::Full,
             writer,
         }));
         assert!(server.clients.contains_key(&7));
@@ -6585,6 +6595,7 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: true,
             direct_graphics: false,
+            app_surface: crate::protocol::AppSurface::Full,
             writer,
         }));
         control_rx
@@ -6999,6 +7010,7 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: false,
             direct_graphics: false,
+            app_surface: crate::protocol::AppSurface::Full,
             writer,
         }));
 
@@ -7034,6 +7046,7 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: true,
             direct_graphics: false,
+            app_surface: crate::protocol::AppSurface::Full,
             writer,
         }));
 
@@ -7068,6 +7081,7 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: false,
             direct_graphics: false,
+            app_surface: crate::protocol::AppSurface::Full,
             writer,
         }));
         assert!(server.has_app_client());
@@ -7169,6 +7183,7 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: true,
             direct_graphics: false,
+            app_surface: crate::protocol::AppSurface::Full,
             writer,
         }));
         assert!(
@@ -9220,6 +9235,7 @@ next_tab = ""
             keybindings: None,
             direct_attach_requested: true,
             direct_graphics: false,
+            app_surface: crate::protocol::AppSurface::Full,
             writer,
         }));
         assert!(
