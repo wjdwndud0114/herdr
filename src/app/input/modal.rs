@@ -672,7 +672,7 @@ fn delete_rename_input_word(state: &mut AppState) {
     }
 }
 
-fn handle_rename_edit_key(state: &mut AppState, key: KeyEvent) {
+pub(super) fn handle_rename_edit_key(state: &mut AppState, key: KeyEvent) {
     match key.code {
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             clear_rename_input(state);
