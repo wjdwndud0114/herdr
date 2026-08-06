@@ -109,6 +109,34 @@ pub(crate) fn render_client_sidebar(app: &AppState, frame: &mut Frame) {
     render_sidebar(app, &terminal_runtimes, frame, app.view.sidebar_rect);
 }
 
+/// Render client-owned navigation and overlays on top of an existing content
+/// frame. The aggregate fleet client supplies the pane pixels while reusing the
+/// exact sidebar, menus, and dialogs from the normal TUI.
+pub(crate) fn render_client_shell(app: &AppState, frame: &mut Frame) {
+    let terminal_runtimes = TerminalRuntimeRegistry::new();
+    if app.view.sidebar_rect.width > 0 {
+        if app.sidebar_collapsed {
+            render_sidebar_collapsed(app, frame, app.view.sidebar_rect);
+        } else {
+            render_sidebar(app, &terminal_runtimes, frame, app.view.sidebar_rect);
+        }
+    }
+
+    match app.mode {
+        Mode::ConfirmClose => {
+            render_confirm_close_overlay(app, &terminal_runtimes, frame, app.view.terminal_area)
+        }
+        Mode::ContextMenu => render_context_menu(app, frame),
+        Mode::Settings => render_settings_overlay(app, frame, frame.area()),
+        Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane => {
+            render_rename_overlay(app, frame, frame.area())
+        }
+        Mode::GlobalMenu => render_global_launcher_menu(app, frame),
+        Mode::KeybindHelp => render_keybind_help_overlay(app, frame),
+        _ => {}
+    }
+}
+
 const COLLAPSED_WIDTH: u16 = 4; // num + space + dot + separator
 
 /// Compute view geometry and reconcile pane sizes.
