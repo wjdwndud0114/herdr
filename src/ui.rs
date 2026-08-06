@@ -117,6 +117,7 @@ pub(crate) fn render_client_shell(app: &AppState, frame: &mut Frame) {
     }
 
     match app.mode {
+        Mode::Navigate => render_navigate_overlay(app, frame, app.view.terminal_area),
         Mode::ConfirmClose => {
             render_confirm_close_overlay(app, &terminal_runtimes, frame, app.view.terminal_area)
         }
@@ -127,6 +128,7 @@ pub(crate) fn render_client_shell(app: &AppState, frame: &mut Frame) {
         }
         Mode::GlobalMenu => render_global_launcher_menu(app, frame),
         Mode::KeybindHelp => render_keybind_help_overlay(app, frame),
+        Mode::Navigator => render_navigator_overlay(app, &terminal_runtimes, frame),
         _ => {}
     }
 }
