@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{MouseButton, MouseEventKind};
+use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use interprocess::local_socket::traits::Stream as _;
 use interprocess::TryClone as _;
 use ratatui::backend::TestBackend;
@@ -15,7 +15,7 @@ use super::{ClientError, ClientLoopEvent};
 use crate::api::client::{ApiClient, ConnectionTarget};
 use crate::api::schema::{
     AgentStatus, AgentTarget, EmptyParams, Method, Request, ResponseResult, SessionSnapshot,
-    WorkspaceTarget,
+    WorkspaceCreateParams, WorkspaceRenameParams, WorkspaceTarget,
 };
 use crate::ipc::LocalStream;
 use crate::protocol::{
@@ -64,10 +64,12 @@ enum SidebarHit {
 struct FleetState {
     instances: Vec<Instance>,
     active: usize,
-    sidebar_width: u16,
-    hits: Vec<Option<SidebarHit>>,
+    sidebar: crate::app::AppState,
+    workspace_routes: HashMap<usize, SidebarHit>,
+    agent_routes: HashMap<(usize, crate::layout::PaneId), SidebarHit>,
     blit_encoder: crate::protocol::render_ansi::BlitEncoder,
     repaint_pending: bool,
+    quit_requested: bool,
     sound_config: crate::config::SoundConfig,
     visual: FleetVisualConfig,
 }
@@ -80,6 +82,14 @@ struct FleetVisualConfig {
     agent_panel_sort: crate::app::state::AgentPanelSort,
     sidebar_agents: crate::config::AgentsSidebarConfig,
     sidebar_spaces: crate::config::SpacesSidebarConfig,
+    sidebar_min_width: u16,
+    sidebar_max_width: u16,
+    sidebar_start_collapsed: bool,
+    sidebar_collapsed_mode: crate::config::SidebarCollapsedModeConfig,
+    confirm_close: bool,
+    keybinds: crate::config::Keybinds,
+    prefix_code: crossterm::event::KeyCode,
+    prefix_mods: crossterm::event::KeyModifiers,
     mouse_capture: bool,
 }
 
@@ -94,6 +104,12 @@ pub(super) fn run() -> io::Result<()> {
     );
     let theme_runtime = crate::app::theme_runtime_config(&loaded.config, true);
     let (palette, theme_name) = crate::app::resolve_effective_theme(&theme_runtime, None);
+    let (prefix_code, prefix_mods) = loaded.config.prefix_key();
+    let (sidebar_min_width, sidebar_max_width) = crate::config::validated_sidebar_bounds(
+        loaded.config.ui.sidebar_min_width,
+        loaded.config.ui.sidebar_max_width,
+    )
+    .unwrap_or((18, 36));
     let visual = FleetVisualConfig {
         palette,
         theme_name,
@@ -104,6 +120,14 @@ pub(super) fn run() -> io::Result<()> {
         ),
         sidebar_agents: loaded.config.ui.sidebar.agents.clone(),
         sidebar_spaces: loaded.config.ui.sidebar.spaces.clone(),
+        sidebar_min_width,
+        sidebar_max_width,
+        sidebar_start_collapsed: loaded.config.ui.sidebar_start_collapsed,
+        sidebar_collapsed_mode: loaded.config.ui.sidebar_collapsed_mode,
+        confirm_close: loaded.config.ui.confirm_close,
+        keybinds: loaded.config.keybinds(),
+        prefix_code,
+        prefix_mods,
         mouse_capture,
     };
     let (cols, rows, _, _) = super::initial_terminal_geometry(false);
@@ -264,21 +288,26 @@ async fn run_loop(
         }
     }
 
+    let mut sidebar = crate::app::AppState::empty_for_client_rendering();
+    configure_sidebar_state(&mut sidebar, &visual, sidebar_width, cols, rows);
     let mut state = FleetState {
         instances,
         active: 0,
-        sidebar_width,
-        hits: Vec::new(),
+        sidebar,
+        workspace_routes: HashMap::new(),
+        agent_routes: HashMap::new(),
         blit_encoder: crate::protocol::render_ansi::BlitEncoder::new(),
         repaint_pending: true,
+        quit_requested: false,
         sound_config,
         visual,
     };
     let mut current_cols = cols;
     let mut current_rows = rows;
+    sync_sidebar_model(&mut state, current_cols, current_rows);
     render(&mut state, current_cols, current_rows);
 
-    while !should_quit.load(Ordering::Acquire) {
+    while !should_quit.load(Ordering::Acquire) && !state.quit_requested {
         tokio::select! {
             input = input_rx.recv() => {
                 if let Some(input) = input {
@@ -291,7 +320,9 @@ async fn run_loop(
             }
             event = fleet_rx.recv() => {
                 if let Some(event) = event {
-                    handle_fleet_event(&mut state, event);
+                    if handle_fleet_event(&mut state, event) {
+                        sync_sidebar_model(&mut state, current_cols, current_rows);
+                    }
                     render(&mut state, current_cols, current_rows);
                 }
             }
@@ -372,7 +403,7 @@ fn spawn_snapshot_poller(
     });
 }
 
-fn handle_fleet_event(state: &mut FleetState, event: FleetEvent) {
+fn handle_fleet_event(state: &mut FleetState, event: FleetEvent) -> bool {
     let instance_id = match &event {
         FleetEvent::ServerMessage { instance_id, .. }
         | FleetEvent::Disconnected { instance_id }
@@ -383,44 +414,58 @@ fn handle_fleet_event(state: &mut FleetState, event: FleetEvent) {
         .iter()
         .position(|instance| &instance.id == instance_id)
     else {
-        return;
+        return false;
     };
 
     match event {
         FleetEvent::ServerMessage { message, .. } => match message {
-            ServerMessage::Frame(frame) => state.instances[index].frame = Some(frame),
+            ServerMessage::Frame(frame) => {
+                state.instances[index].frame = Some(frame);
+                false
+            }
             ServerMessage::Notify {
                 kind,
                 message,
                 body,
             } => {
                 super::handle_notify(kind, &message, body.as_deref(), &state.sound_config);
+                false
             }
             ServerMessage::Clipboard { data } if index == state.active => {
                 super::forward_clipboard(&data);
+                false
             }
             ServerMessage::WindowTitle { title } if index == state.active => {
                 super::write_window_title(title.as_deref());
+                false
             }
             ServerMessage::ServerShutdown { reason } => {
                 state.instances[index].error =
                     Some(reason.unwrap_or_else(|| "server shut down".to_string()));
                 state.instances[index].writer = None;
                 state.instances[index].frame = None;
+                true
             }
-            _ => {}
+            _ => false,
         },
         FleetEvent::Disconnected { .. } => {
             state.instances[index].error = Some("disconnected".to_string());
             state.instances[index].writer = None;
             state.instances[index].frame = None;
+            true
         }
         FleetEvent::Snapshot { result, .. } => match result {
             Ok(snapshot) => {
+                let changed = state.instances[index].snapshot.as_ref() != Some(&snapshot);
                 state.instances[index].snapshot = Some(snapshot);
                 state.instances[index].error = None;
+                changed
             }
-            Err(error) => state.instances[index].error = Some(error),
+            Err(error) => {
+                let changed = state.instances[index].error.as_deref() != Some(error.as_str());
+                state.instances[index].error = Some(error);
+                changed
+            }
         },
     }
 }
@@ -434,55 +479,176 @@ fn handle_input(
     match input {
         ClientLoopEvent::StdinInput(data) => {
             let events = crate::raw_input::parse_raw_input_bytes_sync(&data);
-            if let [crate::raw_input::RawInputEvent::Mouse(mouse)] = events.as_slice() {
-                if mouse.column < state.sidebar_width {
-                    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                        activate_sidebar_row(state, mouse.row as usize);
-                        state.repaint_pending = true;
-                        render(state, current_cols, current_rows);
+            if events.len() > 1
+                && events
+                    .iter()
+                    .all(|event| matches!(event, crate::raw_input::RawInputEvent::Mouse(_)))
+            {
+                let mut sidebar_consumed = false;
+                for event in &events {
+                    let crate::raw_input::RawInputEvent::Mouse(mouse) = event else {
+                        unreachable!("fleet mouse batch was checked above");
+                    };
+                    sidebar_consumed |=
+                        handle_mouse_input(state, *mouse, current_cols, current_rows)?;
+                }
+                if sidebar_consumed {
+                    state.repaint_pending = true;
+                    render(state, current_cols, current_rows);
+                }
+                return Ok(());
+            }
+
+            if events.len() > 1
+                && events
+                    .iter()
+                    .all(|event| matches!(event, crate::raw_input::RawInputEvent::Key(_)))
+            {
+                let previous_width = current_sidebar_width(state, current_cols);
+                let mut actions = Vec::with_capacity(events.len());
+                for event in &events {
+                    let crate::raw_input::RawInputEvent::Key(key) = event else {
+                        unreachable!("fleet key batch was checked above");
+                    };
+                    match crate::app::handle_client_sidebar_key(&mut state.sidebar, key.clone()) {
+                        crate::app::ClientSidebarInput::Forward => {
+                            actions.clear();
+                            break;
+                        }
+                        crate::app::ClientSidebarInput::Consumed(action) => actions.push(action),
                     }
+                }
+                if !actions.is_empty() {
+                    for action in actions.into_iter().flatten() {
+                        dispatch_sidebar_action(state, action);
+                    }
+                    update_sidebar_geometry(state, current_cols, current_rows);
+                    if current_sidebar_width(state, current_cols) != previous_width {
+                        resize_content_streams(state, current_cols, current_rows)?;
+                    }
+                    state.repaint_pending = true;
+                    render(state, current_cols, current_rows);
                     return Ok(());
                 }
-                if let Some(kind) = mouse_kind(mouse.kind) {
-                    let event = ClientInputEvent::Mouse {
-                        kind,
-                        column: mouse.column.saturating_sub(state.sidebar_width),
-                        row: mouse.row,
-                        modifiers: mouse.modifiers.bits(),
-                    };
-                    return write_active(
-                        state,
-                        ClientMessage::InputEvents {
-                            events: vec![event],
-                        },
-                    );
+            }
+
+            if let [event] = events.as_slice() {
+                match event {
+                    crate::raw_input::RawInputEvent::Mouse(mouse) => {
+                        if handle_mouse_input(state, *mouse, current_cols, current_rows)? {
+                            state.repaint_pending = true;
+                            render(state, current_cols, current_rows);
+                            return Ok(());
+                        }
+                    }
+                    crate::raw_input::RawInputEvent::Key(key) => {
+                        match crate::app::handle_client_sidebar_key(&mut state.sidebar, key.clone())
+                        {
+                            crate::app::ClientSidebarInput::Forward => {}
+                            crate::app::ClientSidebarInput::Consumed(action) => {
+                                let previous_width = current_sidebar_width(state, current_cols);
+                                if let Some(action) = action {
+                                    dispatch_sidebar_action(state, action);
+                                }
+                                update_sidebar_geometry(state, current_cols, current_rows);
+                                if current_sidebar_width(state, current_cols) != previous_width {
+                                    resize_content_streams(state, current_cols, current_rows)?;
+                                }
+                                state.repaint_pending = true;
+                                render(state, current_cols, current_rows);
+                                return Ok(());
+                            }
+                        }
+                    }
+                    crate::raw_input::RawInputEvent::Text(text) => {
+                        if crate::app::handle_client_sidebar_text(&mut state.sidebar, text.as_str())
+                        {
+                            state.repaint_pending = true;
+                            render(state, current_cols, current_rows);
+                            return Ok(());
+                        }
+                    }
+                    crate::raw_input::RawInputEvent::Paste(text) => {
+                        if crate::app::handle_client_sidebar_text(&mut state.sidebar, text) {
+                            state.repaint_pending = true;
+                            render(state, current_cols, current_rows);
+                            return Ok(());
+                        }
+                    }
+                    _ => {}
                 }
             }
             write_active(state, ClientMessage::Input { data })
         }
         ClientLoopEvent::Resize(cols, rows, _, _) => {
-            let content_cols = cols.saturating_sub(state.sidebar_width).max(2);
-            for instance in &mut state.instances {
-                instance.frame = None;
-                if let Some(writer) = &mut instance.writer {
-                    super::write_to_server(
-                        writer,
-                        &ClientMessage::Resize {
-                            cols: content_cols,
-                            rows,
-                            cell_width_px: 0,
-                            cell_height_px: 0,
-                        },
-                    )
-                    .map_err(ClientError::ConnectionLost)?;
-                }
-            }
+            update_sidebar_geometry(state, cols, rows);
+            resize_content_streams(state, cols, rows)?;
             state.repaint_pending = true;
             render(state, cols, rows);
             Ok(())
         }
         _ => Ok(()),
     }
+}
+
+fn handle_mouse_input(
+    state: &mut FleetState,
+    mouse: MouseEvent,
+    current_cols: u16,
+    current_rows: u16,
+) -> Result<bool, ClientError> {
+    let sidebar_width = current_sidebar_width(state, current_cols);
+    let sidebar_related = state.sidebar.mode != crate::app::Mode::Terminal
+        || mouse.column < sidebar_width
+        || state.sidebar.drag.is_some();
+    if sidebar_related {
+        if let Some(action) = crate::app::handle_client_sidebar_mouse(&mut state.sidebar, mouse) {
+            dispatch_sidebar_action(state, action);
+        }
+        update_sidebar_geometry(state, current_cols, current_rows);
+        if current_sidebar_width(state, current_cols) != sidebar_width {
+            resize_content_streams(state, current_cols, current_rows)?;
+        }
+        return Ok(true);
+    }
+
+    if let Some(kind) = mouse_kind(mouse.kind) {
+        let event = ClientInputEvent::Mouse {
+            kind,
+            column: mouse.column.saturating_sub(sidebar_width),
+            row: mouse.row,
+            modifiers: mouse.modifiers.bits(),
+        };
+        write_active(
+            state,
+            ClientMessage::InputEvents {
+                events: vec![event],
+            },
+        )?;
+    }
+    Ok(false)
+}
+
+fn resize_content_streams(state: &mut FleetState, cols: u16, rows: u16) -> Result<(), ClientError> {
+    let content_cols = cols
+        .saturating_sub(current_sidebar_width(state, cols))
+        .max(2);
+    for instance in &mut state.instances {
+        instance.frame = None;
+        if let Some(writer) = &mut instance.writer {
+            super::write_to_server(
+                writer,
+                &ClientMessage::Resize {
+                    cols: content_cols,
+                    rows,
+                    cell_width_px: 0,
+                    cell_height_px: 0,
+                },
+            )
+            .map_err(ClientError::ConnectionLost)?;
+        }
+    }
+    Ok(())
 }
 
 fn write_active(state: &mut FleetState, message: ClientMessage) -> Result<(), ClientError> {
@@ -513,11 +679,104 @@ fn mouse_button(button: MouseButton) -> ClientMouseButton {
     }
 }
 
-fn activate_sidebar_row(state: &mut FleetState, row: usize) {
-    let Some(Some(hit)) = state.hits.get(row).cloned() else {
+fn dispatch_sidebar_action(state: &mut FleetState, action: crate::app::ClientSidebarAction) {
+    match action {
+        crate::app::ClientSidebarAction::Redraw => {}
+        crate::app::ClientSidebarAction::NewWorkspace => request_for_active(
+            state,
+            "fleet-workspace-create",
+            Method::WorkspaceCreate(WorkspaceCreateParams {
+                cwd: None,
+                focus: true,
+                label: None,
+                env: Default::default(),
+            }),
+        ),
+        crate::app::ClientSidebarAction::FocusWorkspace { ws_idx } => {
+            focus_sidebar_route(state, ws_idx, None)
+        }
+        crate::app::ClientSidebarAction::FocusPane { ws_idx, pane_id } => {
+            focus_sidebar_route(state, ws_idx, Some(pane_id))
+        }
+        crate::app::ClientSidebarAction::RenameStarted { ws_idx } => {
+            if let Some(SidebarHit::Workspace {
+                index,
+                workspace_id,
+            }) = state.workspace_routes.get(&ws_idx)
+            {
+                if let Some(label) = state.instances[*index]
+                    .snapshot
+                    .as_ref()
+                    .and_then(|snapshot| {
+                        snapshot
+                            .workspaces
+                            .iter()
+                            .find(|workspace| workspace.workspace_id == *workspace_id)
+                    })
+                    .map(|workspace| workspace.label.clone())
+                {
+                    state.sidebar.name_input = label;
+                }
+            }
+        }
+        crate::app::ClientSidebarAction::RenameWorkspace { ws_idx, label } => {
+            if let Some(SidebarHit::Workspace {
+                index,
+                workspace_id,
+            }) = state.workspace_routes.get(&ws_idx).cloned()
+            {
+                request_for_instance(
+                    state,
+                    index,
+                    "fleet-workspace-rename",
+                    Method::WorkspaceRename(WorkspaceRenameParams {
+                        workspace_id,
+                        label,
+                    }),
+                );
+            }
+        }
+        crate::app::ClientSidebarAction::CloseWorkspace { ws_idx } => {
+            if let Some(SidebarHit::Workspace {
+                index,
+                workspace_id,
+            }) = state.workspace_routes.get(&ws_idx).cloned()
+            {
+                request_for_instance(
+                    state,
+                    index,
+                    "fleet-workspace-close",
+                    Method::WorkspaceClose(WorkspaceTarget { workspace_id }),
+                );
+            }
+        }
+        crate::app::ClientSidebarAction::ReloadConfig => {
+            for index in 0..state.instances.len() {
+                request_for_instance(
+                    state,
+                    index,
+                    "fleet-reload-config",
+                    Method::ServerReloadConfig(EmptyParams::default()),
+                );
+            }
+        }
+        crate::app::ClientSidebarAction::Detach => state.quit_requested = true,
+    }
+}
+
+fn focus_sidebar_route(
+    state: &mut FleetState,
+    ws_idx: usize,
+    pane_id: Option<crate::layout::PaneId>,
+) {
+    let route = pane_id
+        .and_then(|pane_id| state.agent_routes.get(&(ws_idx, pane_id)))
+        .or_else(|| state.workspace_routes.get(&ws_idx))
+        .cloned();
+    let Some(route) = route else {
         return;
     };
-    let (index, method) = match hit {
+    let (index, method) = match route {
         SidebarHit::Instance { index } => (index, None),
         SidebarHit::Workspace {
             index,
@@ -531,27 +790,78 @@ fn activate_sidebar_row(state: &mut FleetState, row: usize) {
         }
     };
     state.active = index;
-    if let (Some(method), Some(target)) = (method, state.instances[index].api_target.clone()) {
-        std::thread::spawn(move || {
-            let _ = ApiClient::for_target(target).request(Request {
-                id: "fleet-focus".to_string(),
-                method,
-            });
-        });
+    state.sidebar.active = Some(ws_idx);
+    state.sidebar.selected = ws_idx;
+    if let Some(method) = method {
+        request_for_instance(state, index, "fleet-focus", method);
     }
 }
 
+fn request_for_active(state: &FleetState, id: &'static str, method: Method) {
+    request_for_instance(state, state.active, id, method);
+}
+
+fn request_for_instance(state: &FleetState, index: usize, id: &'static str, method: Method) {
+    let Some(target) = state
+        .instances
+        .get(index)
+        .and_then(|instance| instance.api_target.clone())
+    else {
+        return;
+    };
+    std::thread::spawn(move || {
+        let _ = ApiClient::for_target(target).request(Request {
+            id: id.to_string(),
+            method,
+        });
+    });
+}
+
 fn render(state: &mut FleetState, cols: u16, rows: u16) {
-    let sidebar_width = state.sidebar_width.min(cols.saturating_sub(2));
-    let (sidebar, hits) = render_sidebar(state, sidebar_width, rows);
-    state.hits = hits;
-    let frame = compose_frame(
+    if cols == 0 || rows == 0 {
+        return;
+    }
+    update_sidebar_geometry(state, cols, rows);
+    let sidebar_width = current_sidebar_width(state, cols);
+    let sidebar = render_sidebar_frame(&state.sidebar, sidebar_width, rows);
+    let base = compose_frame(
         sidebar,
         state.instances[state.active].frame.as_ref(),
         cols,
         rows,
         sidebar_width,
     );
+    let Some(base_buffer) = base.to_ratatui_buffer() else {
+        return;
+    };
+    let backend = TestBackend::new(cols, rows);
+    let mut terminal = ratatui::Terminal::new(backend)
+        .expect("fleet shell TestBackend construction should not fail");
+    terminal
+        .draw(|frame| {
+            frame.buffer_mut().clone_from(&base_buffer);
+            crate::ui::render_client_shell(&state.sidebar, frame);
+        })
+        .expect("fleet shell render should not fail");
+    let buffer = terminal.backend().buffer().clone();
+    let cursor = matches!(
+        state.sidebar.mode,
+        crate::app::Mode::Terminal | crate::app::Mode::Prefix
+    )
+    .then(|| base.cursor.clone())
+    .flatten();
+    let mut frame = FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, cursor, &[]);
+    for (rendered, original) in frame.cells.iter_mut().zip(&base.cells) {
+        if rendered.symbol == original.symbol
+            && rendered.fg == original.fg
+            && rendered.bg == original.bg
+            && rendered.modifier == original.modifier
+        {
+            rendered.hyperlink = original.hyperlink;
+        }
+    }
+    frame.hyperlinks = base.hyperlinks;
+    frame.graphics = base.graphics;
     let encoded = state.blit_encoder.encode(&frame, state.repaint_pending);
     let mut stdout = io::stdout();
     let _ = stdout.write_all(&encoded.bytes);
@@ -560,103 +870,129 @@ fn render(state: &mut FleetState, cols: u16, rows: u16) {
     state.repaint_pending = false;
 }
 
-fn render_sidebar(
-    state: &FleetState,
-    width: u16,
-    height: u16,
-) -> (FrameData, Vec<Option<SidebarHit>>) {
+fn render_sidebar_frame(app: &crate::app::AppState, width: u16, height: u16) -> FrameData {
     if width == 0 || height == 0 {
-        return (
-            FrameData {
-                cells: Vec::new(),
-                width,
-                height,
-                cursor: None,
-                hyperlinks: Vec::new(),
-                graphics: Vec::new(),
-            },
-            vec![None; height as usize],
-        );
+        return FrameData {
+            cells: Vec::new(),
+            width,
+            height,
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        };
     }
 
-    let (app, workspace_routes, agent_routes) = build_sidebar_state(state, width, height);
     let backend = TestBackend::new(width, height);
     let mut terminal = ratatui::Terminal::new(backend)
         .expect("fleet sidebar TestBackend construction should not fail");
     terminal
-        .draw(|frame| crate::ui::render_client_sidebar(&app, frame))
+        .draw(|frame| crate::ui::render_client_sidebar(app, frame))
         .expect("fleet sidebar render should not fail");
-
-    let mut hits = vec![None; height as usize];
-    for card in &app.view.workspace_card_areas {
-        let Some(hit) = workspace_routes.get(&card.ws_idx) else {
-            continue;
-        };
-        for row in card.rect.y..card.rect.y.saturating_add(card.rect.height).min(height) {
-            hits[row as usize] = Some(hit.clone());
-        }
-    }
-
-    let (_, detail_area) =
-        crate::ui::expanded_sidebar_sections(app.view.sidebar_rect, app.sidebar_section_split);
-    let metrics = crate::ui::agent_panel_scroll_metrics(&app, detail_area);
-    let body =
-        crate::ui::agent_panel_body_rect(detail_area, crate::ui::should_show_scrollbar(metrics));
-    let entries = crate::ui::agent_panel_entries(&app);
-    let scroll = app.agent_panel_scroll.min(metrics.max_offset_from_bottom);
-    let mut row_y = body.y;
-    let body_bottom = body.y.saturating_add(body.height);
-    for (entry_idx, entry) in entries.iter().enumerate().skip(scroll) {
-        let entry_height = crate::ui::agent_entry_height_in_body(&app, entry, body.height);
-        if row_y.saturating_add(entry_height) > body_bottom {
-            break;
-        }
-        if let Some(hit) = agent_routes.get(&(entry.ws_idx, entry.pane_id)) {
-            for row in row_y..row_y.saturating_add(entry_height).min(height) {
-                hits[row as usize] = Some(hit.clone());
-            }
-        }
-        row_y = row_y
-            .saturating_add(entry_height)
-            .saturating_add(crate::ui::agent_entry_gap(&app, entry_idx, entries.len()))
-            .min(body_bottom);
-    }
-
     let buffer = terminal.backend().buffer().clone();
-    (
-        FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, None, &[]),
-        hits,
-    )
+    FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, None, &[])
+}
+
+fn configure_sidebar_state(
+    app: &mut crate::app::AppState,
+    visual: &FleetVisualConfig,
+    width: u16,
+    cols: u16,
+    rows: u16,
+) {
+    app.sidebar_width = width;
+    app.default_sidebar_width = width;
+    app.sidebar_min_width = visual.sidebar_min_width;
+    app.sidebar_max_width = visual.sidebar_max_width;
+    app.sidebar_section_split = 0.5;
+    app.sidebar_collapsed = visual.sidebar_start_collapsed;
+    app.sidebar_collapsed_mode = visual.sidebar_collapsed_mode;
+    app.status_indicators = visual.status_indicators;
+    app.agent_panel_sort = visual.agent_panel_sort;
+    app.sidebar_agents = visual.sidebar_agents.clone();
+    app.sidebar_spaces = visual.sidebar_spaces.clone();
+    app.mouse_capture = visual.mouse_capture;
+    app.confirm_close = visual.confirm_close;
+    app.keybinds = visual.keybinds.clone();
+    app.prefix_code = visual.prefix_code;
+    app.prefix_mods = visual.prefix_mods;
+    app.palette = visual.palette.clone();
+    app.theme_name = visual.theme_name.clone();
+    app.theme_runtime = visual.theme_runtime.clone();
+    app.mode = crate::app::Mode::Terminal;
+    app.view.layout = crate::app::state::ViewLayout::Desktop;
+    let sidebar_width = current_app_sidebar_width(app, cols);
+    app.view.sidebar_rect = Rect::new(0, 0, sidebar_width, rows);
+    app.view.terminal_area = Rect::new(sidebar_width, 0, cols.saturating_sub(sidebar_width), rows);
+}
+
+fn sync_sidebar_model(state: &mut FleetState, cols: u16, rows: u16) {
+    let (mut model, workspace_routes, agent_routes) = build_sidebar_state(state, cols, rows);
+    state.sidebar.terminals = std::mem::take(&mut model.terminals);
+    state.sidebar.workspaces = std::mem::take(&mut model.workspaces);
+    state.sidebar.active = model.active;
+    if !matches!(
+        state.sidebar.mode,
+        crate::app::Mode::RenameWorkspace
+            | crate::app::Mode::ContextMenu
+            | crate::app::Mode::ConfirmClose
+    ) {
+        state.sidebar.selected = model.selected;
+    }
+    state.workspace_routes = workspace_routes;
+    state.agent_routes = agent_routes;
+    update_sidebar_geometry(state, cols, rows);
+    state.sidebar.workspace_scroll = crate::ui::normalized_workspace_scroll(
+        &state.sidebar,
+        state.sidebar.view.sidebar_rect,
+        state.sidebar.workspace_scroll,
+    );
+    state.sidebar.view.workspace_card_areas =
+        crate::ui::compute_workspace_card_areas(&state.sidebar, state.sidebar.view.sidebar_rect);
+}
+
+fn current_app_sidebar_width(app: &crate::app::AppState, cols: u16) -> u16 {
+    let desired = if app.sidebar_collapsed {
+        match app.sidebar_collapsed_mode {
+            crate::config::SidebarCollapsedModeConfig::Compact => 4,
+            crate::config::SidebarCollapsedModeConfig::Hidden => 0,
+        }
+    } else {
+        app.sidebar_width
+            .clamp(app.sidebar_min_width, app.sidebar_max_width)
+    };
+    desired.min(cols.saturating_sub(2))
+}
+
+fn current_sidebar_width(state: &FleetState, cols: u16) -> u16 {
+    current_app_sidebar_width(&state.sidebar, cols)
+}
+
+fn update_sidebar_geometry(state: &mut FleetState, cols: u16, rows: u16) {
+    let width = current_sidebar_width(state, cols);
+    state.sidebar.view.layout = crate::app::state::ViewLayout::Desktop;
+    state.sidebar.view.sidebar_rect = Rect::new(0, 0, width, rows);
+    state.sidebar.view.terminal_area = Rect::new(width, 0, cols.saturating_sub(width), rows);
+    state.sidebar.view.workspace_card_areas =
+        crate::ui::compute_workspace_card_areas(&state.sidebar, state.sidebar.view.sidebar_rect);
 }
 
 fn build_sidebar_state(
     state: &FleetState,
-    width: u16,
-    height: u16,
+    cols: u16,
+    rows: u16,
 ) -> (
     crate::app::AppState,
     HashMap<usize, SidebarHit>,
     HashMap<(usize, crate::layout::PaneId), SidebarHit>,
 ) {
     let mut app = crate::app::AppState::empty_for_client_rendering();
-    app.sidebar_width = width;
-    app.default_sidebar_width = state.sidebar_width;
-    app.sidebar_min_width = width;
-    app.sidebar_max_width = width;
-    app.sidebar_section_split = 0.5;
-    app.sidebar_collapsed = false;
-    app.status_indicators = state.visual.status_indicators;
-    app.agent_panel_sort = state.visual.agent_panel_sort;
-    app.sidebar_agents = state.visual.sidebar_agents.clone();
-    app.sidebar_spaces = state.visual.sidebar_spaces.clone();
-    app.mouse_capture = state.visual.mouse_capture;
-    app.palette = state.visual.palette.clone();
-    app.theme_name = state.visual.theme_name.clone();
-    app.theme_runtime = state.visual.theme_runtime.clone();
-    app.mode = crate::app::Mode::Terminal;
-    app.view.layout = crate::app::state::ViewLayout::Desktop;
-    app.view.sidebar_rect = Rect::new(0, 0, width, height);
-    app.view.terminal_area = Rect::new(width, 0, 0, height);
+    configure_sidebar_state(
+        &mut app,
+        &state.visual,
+        state.sidebar.sidebar_width,
+        cols,
+        rows,
+    );
 
     let mut workspace_routes = HashMap::new();
     let mut agent_routes = HashMap::new();

@@ -16,6 +16,10 @@ mod custom_commands;
 mod git_refresh;
 mod ids;
 pub(crate) mod pane_graphics;
+pub(crate) use input::{
+    handle_client_sidebar_key, handle_client_sidebar_mouse, handle_client_sidebar_text,
+    ClientSidebarAction, ClientSidebarInput,
+};
 mod popup;
 mod runtime;
 mod session;
