@@ -133,7 +133,7 @@ impl FleetRegistry {
             digest.update(std::process::id().to_le_bytes());
             digest.update(nanos.to_le_bytes());
             digest.update(nonce.to_le_bytes());
-            let encoded = format!("{digest:x}");
+            let encoded = format!("{:x}", digest.finalize());
             let id = InstanceId(format!("remote-{}", &encoded[..16]));
             if self.instances.iter().all(|instance| instance.id != id) {
                 return id;

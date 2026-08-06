@@ -262,6 +262,16 @@ impl RemoteHerdr {
         }
     }
 
+    fn for_fleet_platform(platform: RemotePlatform) -> Self {
+        let install_suffix = ".local/bin/herdr-multi".to_string();
+        let shell_path = format!("\"$HOME/{install_suffix}\"");
+        Self {
+            install_suffix,
+            shell_path,
+            platform,
+        }
+    }
+
     fn with_shell_path(mut self, shell_path: String) -> Self {
         self.shell_path = shell_path;
         self
@@ -698,6 +708,24 @@ fn prepare_remote_herdr(
         remote_herdr,
         installed_or_replaced: true,
         stop_after_install_approved,
+    })
+}
+
+fn prepare_fleet_remote_herdr(ssh: &RemoteSsh) -> io::Result<PreparedRemoteHerdr> {
+    let platform = detect_remote_platform(ssh)?;
+    let remote_herdr = RemoteHerdr::for_fleet_platform(platform);
+    if !remote_binary_matches(ssh, &remote_herdr)? {
+        return Err(io::Error::other(format!(
+            "remote fleet binary {} is missing or incompatible; install this build as ~/.local/bin/herdr-multi on {}",
+            remote_herdr.shell_path,
+            ssh.target()
+        )));
+    }
+
+    Ok(PreparedRemoteHerdr {
+        remote_herdr,
+        installed_or_replaced: false,
+        stop_after_install_approved: false,
     })
 }
 
@@ -1795,7 +1823,7 @@ pub(crate) fn start_fleet_remote_bridge(
         .remote
         .manage_ssh_config;
     let remote_ssh = RemoteSsh::new(target.to_string(), manage_ssh_config);
-    let prepared_remote = prepare_remote_herdr(&remote_ssh, false)?;
+    let prepared_remote = prepare_fleet_remote_herdr(&remote_ssh)?;
     ensure_remote_server_ready(
         &remote_ssh,
         &prepared_remote.remote_herdr,
