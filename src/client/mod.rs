@@ -842,6 +842,7 @@ fn do_handshake(
     exact_cell_size: bool,
     requested_encoding: RenderEncoding,
     direct_attach_requested: bool,
+    app_surface: crate::protocol::AppSurface,
 ) -> Result<RenderEncoding, ClientError> {
     stream
         .set_nonblocking(false)
@@ -862,6 +863,7 @@ fn do_handshake(
             cell_width_px,
             cell_height_px,
         ),
+        app_surface,
     };
     protocol::write_message(stream, &hello)
         .map_err(|e| ClientError::ConnectionFailed(io::Error::other(e.to_string())))?;
@@ -1046,6 +1048,7 @@ fn connect_terminal_session_stream(
         false,
         RenderEncoding::TerminalAnsi,
         true,
+        crate::protocol::AppSurface::Full,
     ) {
         Ok(RenderEncoding::TerminalAnsi) => {}
         Ok(encoding) => {
@@ -1277,6 +1280,7 @@ fn run_client_with_mode(
         exact_cell_size,
         requested_encoding,
         direct_attach_requested,
+        crate::protocol::AppSurface::Full,
     ) {
         Ok(encoding) => encoding,
         Err(err) => {

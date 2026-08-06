@@ -17,6 +17,7 @@ mod scrollbar;
 mod settings;
 mod sidebar;
 mod status;
+pub(crate) use self::status::set_working_animation_frame;
 mod tab_surface;
 mod tabs;
 mod text;
@@ -108,29 +109,104 @@ use crate::terminal::TerminalRuntimeRegistry;
 /// exact sidebar, menus, and dialogs from the normal TUI.
 pub(crate) fn render_client_shell(app: &AppState, frame: &mut Frame) {
     let terminal_runtimes = TerminalRuntimeRegistry::new();
-    if app.view.sidebar_rect.width > 0 {
-        if app.sidebar_collapsed {
-            render_sidebar_collapsed(app, frame, app.view.sidebar_rect);
+    render_navigation_chrome(app, &terminal_runtimes, frame);
+    render_notifications(app, frame, app.view.terminal_area);
+    render_interactive_overlay(
+        app,
+        &terminal_runtimes,
+        frame,
+        app.view.terminal_area,
+        app.view.terminal_area,
+    );
+}
+
+/// Compute the navigation-owned portion of a client-composed surface.
+///
+/// This follows the same responsive threshold, sidebar sizing, scroll
+/// normalization, and mobile-header geometry as the full app, but leaves the
+/// returned terminal area for a separately rendered content server.
+pub(crate) fn compute_client_shell_view(app: &mut AppState, area: Rect) {
+    if is_mobile_width(area, app.mobile_width_threshold) {
+        let header_h = area.height.min(2);
+        let (header_rect, terminal_area) = if area.height > header_h {
+            let [header_rect, terminal_area] =
+                Layout::vertical([Constraint::Length(header_h), Constraint::Min(1)]).areas(area);
+            (header_rect, terminal_area)
         } else {
-            render_sidebar(app, &terminal_runtimes, frame, app.view.sidebar_rect);
+            (area, Rect::default())
+        };
+        if app.mode == Mode::Navigate {
+            let switcher_viewport_h = area.height.saturating_sub(header_h + 1);
+            app.mobile_switcher_scroll =
+                app.mobile_switcher_scroll
+                    .min(mobile_switcher_max_scroll_for_height(
+                        app,
+                        switcher_viewport_h,
+                    ));
         }
+        let header_hits = compute_mobile_header_hit_areas(app, header_rect);
+        app.view = crate::app::ViewState {
+            layout: ViewLayout::Mobile,
+            sidebar_rect: Rect::default(),
+            workspace_card_areas: Vec::new(),
+            tab_bar_rect: Rect::default(),
+            tab_hit_areas: Vec::new(),
+            tab_scroll_left_hit_area: Rect::default(),
+            tab_scroll_right_hit_area: Rect::default(),
+            new_tab_hit_area: Rect::default(),
+            terminal_area,
+            mobile_header_rect: header_rect,
+            mobile_menu_hit_area: header_hits.menu,
+            toast_hit_area: Rect::default(),
+            pane_infos: Vec::new(),
+            split_borders: Vec::new(),
+        };
+        return;
     }
 
-    match app.mode {
-        Mode::Navigate => render_navigate_overlay(app, frame, app.view.terminal_area),
-        Mode::ConfirmClose => {
-            render_confirm_close_overlay(app, &terminal_runtimes, frame, app.view.terminal_area)
+    let sidebar_w = if app.sidebar_collapsed {
+        match app.sidebar_collapsed_mode {
+            crate::config::SidebarCollapsedModeConfig::Compact => COLLAPSED_WIDTH,
+            crate::config::SidebarCollapsedModeConfig::Hidden => 0,
         }
-        Mode::ContextMenu => render_context_menu(app, frame),
-        Mode::Settings => render_settings_overlay(app, frame, frame.area()),
-        Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane => {
-            render_rename_overlay(app, frame, frame.area())
-        }
-        Mode::GlobalMenu => render_global_launcher_menu(app, frame),
-        Mode::KeybindHelp => render_keybind_help_overlay(app, frame),
-        Mode::Navigator => render_navigator_overlay(app, &terminal_runtimes, frame),
-        _ => {}
+    } else {
+        app.sidebar_width
+            .clamp(app.sidebar_min_width, app.sidebar_max_width)
+    };
+    let [sidebar_area, terminal_area] =
+        Layout::horizontal([Constraint::Length(sidebar_w), Constraint::Min(1)]).areas(area);
+    if app.sidebar_collapsed {
+        app.workspace_scroll = app
+            .workspace_scroll
+            .min(app.workspaces.len().saturating_sub(1));
+        app.agent_panel_scroll = 0;
+    } else {
+        app.workspace_scroll = normalized_workspace_scroll(app, sidebar_area, app.workspace_scroll);
+        let (_, detail_area) = expanded_sidebar_sections(sidebar_area, app.sidebar_section_split);
+        let max_agent_scroll = agent_panel_scroll_metrics(app, detail_area).max_offset_from_bottom;
+        app.agent_panel_scroll = app.agent_panel_scroll.min(max_agent_scroll);
     }
+    let workspace_card_areas = if app.sidebar_collapsed {
+        Vec::new()
+    } else {
+        compute_workspace_card_areas(app, sidebar_area)
+    };
+    app.view = crate::app::ViewState {
+        layout: ViewLayout::Desktop,
+        sidebar_rect: sidebar_area,
+        workspace_card_areas,
+        tab_bar_rect: Rect::default(),
+        tab_hit_areas: Vec::new(),
+        tab_scroll_left_hit_area: Rect::default(),
+        tab_scroll_right_hit_area: Rect::default(),
+        new_tab_hit_area: Rect::default(),
+        terminal_area,
+        mobile_header_rect: Rect::default(),
+        mobile_menu_hit_area: Rect::default(),
+        toast_hit_area: Rect::default(),
+        pane_infos: Vec::new(),
+        split_borders: Vec::new(),
+    };
 }
 
 const COLLAPSED_WIDTH: u16 = 4; // num + space + dot + separator
@@ -553,6 +629,16 @@ fn render_app_surface(
         terminal_area
     };
 
+    render_interactive_overlay(app, terminal_runtimes, frame, mode_bar_area, terminal_area);
+}
+
+fn render_interactive_overlay(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    frame: &mut Frame,
+    mode_bar_area: Rect,
+    terminal_area: Rect,
+) {
     match app.mode {
         Mode::Onboarding => render_onboarding_overlay(app, frame, frame.area()),
         Mode::ReleaseNotes => render_release_notes_overlay(app, frame, frame.area()),
