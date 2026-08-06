@@ -91,6 +91,25 @@ pub(crate) enum ClientSidebarAction {
     CloseWorkspace {
         ws_idx: usize,
     },
+    SaveTheme {
+        name: String,
+    },
+    SaveStatusIndicators {
+        style: crate::config::StatusIndicatorStyle,
+    },
+    SaveSound {
+        enabled: bool,
+    },
+    SaveToastDelivery {
+        delivery: crate::config::ToastDelivery,
+    },
+    SaveAgentBorderLabels {
+        enabled: bool,
+    },
+    InstallRecommendedIntegrations,
+    SaveAgentPanelSort {
+        sort: crate::app::state::AgentPanelSort,
+    },
     ReloadConfig,
     Detach,
 }
@@ -183,13 +202,34 @@ fn apply_client_sidebar_context_action(
     }
 }
 
+fn client_sidebar_settings_action(action: SettingsAction) -> ClientSidebarAction {
+    match action {
+        SettingsAction::SaveTheme(name) => ClientSidebarAction::SaveTheme { name },
+        SettingsAction::SaveStatusIndicators(style) => {
+            ClientSidebarAction::SaveStatusIndicators { style }
+        }
+        SettingsAction::SaveSound(enabled) => ClientSidebarAction::SaveSound { enabled },
+        SettingsAction::SaveToastDelivery(delivery) => {
+            ClientSidebarAction::SaveToastDelivery { delivery }
+        }
+        SettingsAction::SaveAgentBorderLabels(enabled) => {
+            ClientSidebarAction::SaveAgentBorderLabels { enabled }
+        }
+        SettingsAction::InstallRecommendedIntegrations => {
+            ClientSidebarAction::InstallRecommendedIntegrations
+        }
+    }
+}
+
 pub(crate) fn handle_client_sidebar_mouse(
     state: &mut AppState,
     mouse: MouseEvent,
 ) -> Option<ClientSidebarAction> {
     let mut runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+    let previous_settings_section = state.settings.section;
+    let previous_agent_panel_sort = state.agent_panel_sort;
     let action = state.handle_mouse(&mut runtimes, mouse);
-    let action = match action {
+    let mut action = match action {
         Some(MouseAction::NewWorkspace) => Some(ClientSidebarAction::NewWorkspace),
         Some(MouseAction::FocusWorkspace { ws_idx }) => {
             Some(ClientSidebarAction::FocusWorkspace { ws_idx })
@@ -203,11 +243,22 @@ pub(crate) fn handle_client_sidebar_mouse(
             state.mode = Mode::Terminal;
             Some(ClientSidebarAction::CloseWorkspace { ws_idx })
         }
+        Some(MouseAction::Settings(action)) => Some(client_sidebar_settings_action(action)),
         Some(MouseAction::ContextMenu { menu, idx }) => {
             apply_client_sidebar_context_action(state, menu, idx)
         }
         _ => None,
     };
+    if previous_settings_section != crate::app::state::SettingsSection::Integrations
+        && state.settings.section == crate::app::state::SettingsSection::Integrations
+    {
+        state.integration_recommendations = crate::integration::integration_recommendations();
+    }
+    if action.is_none() && previous_agent_panel_sort != state.agent_panel_sort {
+        action = Some(ClientSidebarAction::SaveAgentPanelSort {
+            sort: state.agent_panel_sort,
+        });
+    }
     take_client_sidebar_request(state).or(action)
 }
 
@@ -273,6 +324,7 @@ fn handle_client_sidebar_action_key(
         return None;
     }
     if matches(&state.keybinds.settings) {
+        state.integration_recommendations = crate::integration::integration_recommendations();
         settings::open_settings(state);
         return None;
     }
@@ -338,10 +390,16 @@ pub(crate) fn handle_client_sidebar_key(
             _ => None,
         },
         Mode::Settings => {
-            if key_event.code == KeyCode::Esc {
-                modal::leave_modal(state);
+            let previous_section = state.settings.section;
+            let action = settings::update_settings_state(state, key_event)
+                .map(client_sidebar_settings_action);
+            if previous_section != crate::app::state::SettingsSection::Integrations
+                && state.settings.section == crate::app::state::SettingsSection::Integrations
+            {
+                state.integration_recommendations =
+                    crate::integration::integration_recommendations();
             }
-            None
+            action
         }
         Mode::Prefix => {
             if key.kind != crossterm::event::KeyEventKind::Press
