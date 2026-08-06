@@ -155,6 +155,82 @@ pub(crate) fn compute_view_without_resizing_panes(
     );
 }
 
+/// Compute geometry for a client-owned shell that supplies its own navigation.
+pub(crate) fn compute_content_view_with_cell_size(
+    app: &mut AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    area: Rect,
+    resize_panes: bool,
+    cell_size: crate::kitty_graphics::HostCellSize,
+) {
+    let (tab_bar_rect, terminal_area) = app
+        .active
+        .and_then(|index| app.workspaces.get(index))
+        .map(|workspace| desktop_tab_bar_and_terminal_area(app, workspace, area))
+        .unwrap_or((Rect::default(), area));
+
+    let tab_bar_view = app
+        .active
+        .and_then(|index| app.workspaces.get(index))
+        .map(|workspace| {
+            compute_tab_bar_view(
+                workspace,
+                tab_bar_rect,
+                app.tab_scroll,
+                app.tab_scroll_follow_active,
+                app.mouse_capture,
+            )
+        })
+        .unwrap_or_default();
+    app.tab_scroll = tab_bar_view.scroll;
+
+    let TabSurfaceLayout {
+        pane_infos,
+        split_borders,
+    } = compute_tab_surface(
+        app,
+        terminal_runtimes,
+        terminal_area,
+        resize_panes,
+        cell_size,
+    );
+    if resize_panes {
+        resize_background_tab_panes_for_desktop(app, terminal_runtimes, area, cell_size);
+        resize_popup_pane(app, terminal_runtimes, terminal_area, cell_size);
+    }
+
+    let toast_hit_area = app
+        .toast
+        .as_ref()
+        .map(|toast| {
+            toast_notification_rect(
+                area,
+                toast,
+                app.config_diagnostic.is_some(),
+                toast.position.unwrap_or(app.toast_config.herdr.position),
+            )
+        })
+        .unwrap_or_default();
+
+    app.view = crate::app::ViewState {
+        layout: ViewLayout::Desktop,
+        sidebar_rect: Rect::default(),
+        workspace_card_areas: Vec::new(),
+        tab_bar_rect,
+        tab_hit_areas: tab_bar_view.tab_hit_areas,
+        tab_scroll_left_hit_area: tab_bar_view.scroll_left_hit_area,
+        tab_scroll_right_hit_area: tab_bar_view.scroll_right_hit_area,
+        new_tab_hit_area: tab_bar_view.new_tab_hit_area,
+        terminal_area,
+        mobile_header_rect: Rect::default(),
+        mobile_menu_hit_area: Rect::default(),
+        toast_hit_area,
+        pane_infos,
+        split_borders,
+    };
+    app.sync_copy_mode_search_geometry();
+}
+
 fn resize_background_tab_panes_to_area(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
@@ -398,10 +474,29 @@ pub fn render_with_runtime_registry(
     terminal_runtimes: &TerminalRuntimeRegistry,
     frame: &mut Frame,
 ) {
+    render_app_surface(app, terminal_runtimes, frame, true);
+}
+
+pub(crate) fn render_content_with_runtime_registry(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    frame: &mut Frame,
+) {
+    render_app_surface(app, terminal_runtimes, frame, false);
+}
+
+fn render_app_surface(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    frame: &mut Frame,
+    include_navigation: bool,
+) {
     let tab_bar_area = app.view.tab_bar_rect;
     let terminal_area = app.view.terminal_area;
 
-    render_navigation_chrome(app, terminal_runtimes, frame);
+    if include_navigation {
+        render_navigation_chrome(app, terminal_runtimes, frame);
+    }
     if app.view.layout != ViewLayout::Mobile {
         render_tab_bar(app, frame, tab_bar_area);
     }

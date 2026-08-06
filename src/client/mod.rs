@@ -14,6 +14,8 @@
 
 #[cfg(unix)]
 mod direct_graphics;
+#[cfg(unix)]
+mod fleet;
 mod input;
 
 use std::collections::HashSet;
@@ -927,6 +929,10 @@ enum ClientLoopEvent {
 ///
 /// This is the entry point called from `main.rs` when running in client mode.
 pub fn run_client() -> io::Result<()> {
+    #[cfg(unix)]
+    if fleet::is_enabled() {
+        return fleet::run();
+    }
     run_client_with_mode(
         requested_render_encoding(),
         None,

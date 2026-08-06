@@ -100,6 +100,44 @@ Use `--session` with `--remote` to attach to a named session on the remote host:
 herdr --remote workbox --session agents
 ```
 
+## Multi-instance client (experimental)
+
+This custom build can show the local session and several SSH-hosted Herdr
+sessions in one client. Configure the remote instances locally:
+
+```bash
+herdr remote add workbox --name work --session agents
+herdr remote add gpu-box --name gpu
+herdr remote list
+```
+
+The next normal `herdr` launch opens a client-owned fleet sidebar. It polls the
+JSON API on every configured instance, shows their workspaces and agents, and
+streams the selected instance into the content area. Click a host, workspace,
+or agent row to switch and focus it. Disable or remove an instance without
+changing anything on the remote host:
+
+```bash
+herdr remote disable <REMOTE_ID>
+herdr remote enable <REMOTE_ID>
+herdr remote remove <REMOTE_ID>
+```
+
+Definitions are stored in `~/.config/herdr/remotes.toml` (or the matching XDG
+config directory). Only SSH destinations, labels, session names, and stable
+instance IDs are stored; authentication stays in OpenSSH and ssh-agent.
+
+All hosts need this same custom build because the fleet client uses protocol
+20's content-only app surface. For a local custom build, point remote bootstrap
+at the matching binary before launching:
+
+```bash
+HERDR_REMOTE_BINARY=target/release/herdr herdr
+```
+
+This multi-instance path is currently a Unix-only proof of concept. Ordinary
+single-instance launches remain unchanged when there are no enabled remotes.
+
 ## Direct terminal attach
 
 Full Herdr attach opens the whole workspace UI. Direct attach opens one server-owned terminal in your current terminal.
