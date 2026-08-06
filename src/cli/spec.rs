@@ -31,6 +31,7 @@ pub(super) fn command() -> Command {
         .subcommand(status_command())
         .subcommand(config_command())
         .subcommand(channel_command())
+        .subcommand(remote_command())
         .subcommand(server_command())
         .subcommand(api_command())
         .subcommand(workspace_command())
@@ -152,6 +153,38 @@ fn channel_command() -> Command {
                     .required(true)
                     .value_parser(["stable", "preview"]),
             ),
+        )
+}
+
+fn remote_command() -> Command {
+    Command::new("remote")
+        .about("Manage remote Herdr instances shown by this client")
+        .subcommand(
+            Command::new("list")
+                .about("List configured remote instances")
+                .arg(json_flag()),
+        )
+        .subcommand(
+            Command::new("add")
+                .about("Add an SSH remote instance")
+                .arg(required("target", "SSH_TARGET"))
+                .arg(option("name", "NAME"))
+                .arg(option("session", "NAME")),
+        )
+        .subcommand(
+            Command::new("remove")
+                .about("Remove a remote instance")
+                .arg(required("remote_id", "REMOTE_ID")),
+        )
+        .subcommand(
+            Command::new("enable")
+                .about("Enable a remote instance")
+                .arg(required("remote_id", "REMOTE_ID")),
+        )
+        .subcommand(
+            Command::new("disable")
+                .about("Disable a remote instance")
+                .arg(required("remote_id", "REMOTE_ID")),
         )
 }
 

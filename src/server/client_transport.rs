@@ -326,6 +326,11 @@ pub(crate) enum ServerEvent {
         target: String,
         takeover: bool,
     },
+    /// An app client changed the portion of the interface it wants rendered.
+    ClientSetAppSurface {
+        client_id: u64,
+        surface: crate::protocol::AppSurface,
+    },
     /// A direct terminal attach client requested scrollback movement.
     ClientAttachScroll {
         client_id: u64,
@@ -776,6 +781,9 @@ fn client_read_loop(
                     target,
                     takeover,
                 }
+            }
+            ClientMessage::SetAppSurface { surface } => {
+                ServerEvent::ClientSetAppSurface { client_id, surface }
             }
             ClientMessage::ClipboardImage { extension, data } => {
                 if data.len() > MAX_CLIPBOARD_IMAGE_PAYLOAD {

@@ -345,6 +345,52 @@ pub(crate) fn render_virtual_with_runtime_registry(
     (buffer, cursor)
 }
 
+/// Render workspace content for a client that owns the surrounding navigation shell.
+pub(crate) fn render_content_virtual_with_runtime_registry(
+    app_state: &mut AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    area: Rect,
+    resize_panes: bool,
+    cell_size: crate::kitty_graphics::HostCellSize,
+) -> (ratatui::buffer::Buffer, Option<CursorState>) {
+    let popup_visible = app_state.popup_pane.is_some();
+    let pre_compute_suppresses_focused_terminal_cursor =
+        !popup_visible && focused_terminal_suppresses_host_cursor(app_state, terminal_runtimes);
+    crate::ui::compute_content_view_with_cell_size(
+        app_state,
+        terminal_runtimes,
+        area,
+        resize_panes,
+        cell_size,
+    );
+    let suppress_focused_terminal_cursor = pre_compute_suppresses_focused_terminal_cursor
+        || (!popup_visible
+            && focused_terminal_suppresses_host_cursor(app_state, terminal_runtimes));
+
+    let backend = CursorTrackingBackend::new(area.width, area.height);
+    let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend::new should never fail");
+    terminal
+        .draw(|frame| {
+            crate::ui::render_content_with_runtime_registry(app_state, terminal_runtimes, frame);
+        })
+        .expect("render to TestBackend should never fail");
+
+    let buffer = terminal.backend().buffer().clone();
+    let cursor = if popup_visible {
+        popup_terminal_cursor(app_state, terminal_runtimes)
+    } else if suppress_focused_terminal_cursor {
+        None
+    } else {
+        focused_terminal_cursor(app_state, terminal_runtimes).or_else(|| {
+            (!focused_terminal_owns_host_cursor(app_state, terminal_runtimes))
+                .then(|| terminal.backend().rendered_cursor())
+                .flatten()
+        })
+    };
+
+    (buffer, cursor)
+}
+
 fn popup_terminal_cursor(
     app_state: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,

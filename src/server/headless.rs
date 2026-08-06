@@ -2826,6 +2826,17 @@ impl HeadlessServer {
                 self.nudge_handoff_panes_on_first_client_attach();
                 true
             }
+            ServerEvent::ClientSetAppSurface { client_id, surface } => {
+                let Some(client) = self.clients.get_mut(&client_id) else {
+                    return false;
+                };
+                if !client.is_full_app_client() || client.app_surface == surface {
+                    return false;
+                }
+                client.app_surface = surface;
+                client.render_state.reset_baseline();
+                true
+            }
             ServerEvent::ClientAttachTerminal {
                 client_id,
                 terminal_id,
@@ -3844,13 +3855,16 @@ impl HeadlessServer {
         }
 
         let render_targets = render_targets(&self.clients, self.foreground_client_id);
-        let [(client_id, (cols, rows), cell_size, _is_foreground, mode)] =
+        let [(client_id, (cols, rows), cell_size, _is_foreground, mode, app_surface)] =
             render_targets.as_slice()
         else {
             retained_fallback!("multiple_or_no_target");
         };
         if !matches!(mode, ClientConnectionMode::App) {
             retained_fallback!("not_app_client");
+        }
+        if !matches!(app_surface, crate::protocol::AppSurface::Full) {
+            retained_fallback!("content_app_surface");
         }
         let Some(client) = self.clients.get(client_id) else {
             retained_fallback!("client_missing");
@@ -4061,7 +4075,8 @@ impl HeadlessServer {
 
         let mut broken_clients: Vec<u64> = Vec::new();
         let mut deferred_frame = false;
-        for (client_id, (cols, rows), cell_size, is_foreground, mode) in render_targets {
+        for (client_id, (cols, rows), cell_size, is_foreground, mode, app_surface) in render_targets
+        {
             let area = Rect::new(0, 0, cols, rows);
             let is_app_client = matches!(mode, ClientConnectionMode::App);
             let mut frame = match mode {
@@ -4079,14 +4094,24 @@ impl HeadlessServer {
                         self.app.state.tab_scroll,
                         self.app.state.mobile_switcher_scroll,
                     ));
-                    let (buffer, cursor) =
-                        crate::server::render_stream::render_virtual_with_runtime_registry(
+                    let (buffer, cursor) = match app_surface {
+                        crate::protocol::AppSurface::Full => {
+                            crate::server::render_stream::render_virtual_with_runtime_registry(
+                                &mut self.app.state,
+                                &self.app.terminal_runtimes,
+                                area,
+                                is_foreground,
+                                render_cell_size,
+                            )
+                        }
+                        crate::protocol::AppSurface::Content => crate::server::render_stream::render_content_virtual_with_runtime_registry(
                             &mut self.app.state,
                             &self.app.terminal_runtimes,
                             area,
                             is_foreground,
                             render_cell_size,
-                        );
+                        ),
+                    };
                     if let Some((workspace, agent_panel, tab, mobile_switcher)) = preserved_scroll {
                         self.app.state.workspace_scroll = workspace;
                         self.app.state.agent_panel_scroll = agent_panel;
