@@ -18,6 +18,8 @@ mod clipboard_images;
 mod direct_graphics;
 mod endpoint_commands;
 mod errors;
+#[cfg(unix)]
+mod fleet;
 mod frame_output;
 mod handshake;
 mod input;
@@ -317,6 +319,10 @@ enum ClientLoopEvent {
 ///
 /// This is the entry point called from `main.rs` when running in client mode.
 pub fn run_client() -> io::Result<()> {
+    #[cfg(unix)]
+    if fleet::is_enabled() {
+        return fleet::run();
+    }
     run_client_with_mode(None, None, "connecting to server")
 }
 
