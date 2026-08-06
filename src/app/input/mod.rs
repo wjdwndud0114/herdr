@@ -77,6 +77,10 @@ pub(crate) enum ClientSidebarAction {
     FocusWorkspace {
         ws_idx: usize,
     },
+    FocusTab {
+        ws_idx: usize,
+        tab_idx: usize,
+    },
     FocusPane {
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
@@ -221,6 +225,20 @@ fn client_sidebar_settings_action(action: SettingsAction) -> ClientSidebarAction
     }
 }
 
+fn client_sidebar_navigator_action(target: super::state::NavigatorTarget) -> ClientSidebarAction {
+    match target {
+        super::state::NavigatorTarget::Workspace { ws_idx } => {
+            ClientSidebarAction::FocusWorkspace { ws_idx }
+        }
+        super::state::NavigatorTarget::Tab { ws_idx, tab_idx } => {
+            ClientSidebarAction::FocusTab { ws_idx, tab_idx }
+        }
+        super::state::NavigatorTarget::Pane {
+            ws_idx, pane_id, ..
+        } => ClientSidebarAction::FocusPane { ws_idx, pane_id },
+    }
+}
+
 pub(crate) fn handle_client_sidebar_mouse(
     state: &mut AppState,
     mouse: MouseEvent,
@@ -228,6 +246,21 @@ pub(crate) fn handle_client_sidebar_mouse(
     let mut runtimes = crate::terminal::TerminalRuntimeRegistry::new();
     let previous_settings_section = state.settings.section;
     let previous_agent_panel_sort = state.agent_panel_sort;
+    let navigator_target = if state.mode == Mode::Navigator
+        && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        && !state.navigator_search_contains(mouse.column, mouse.row)
+    {
+        state
+            .navigator_row_index_at_from(&runtimes, mouse.column, mouse.row)
+            .and_then(|idx| state.navigator_rows_from(&runtimes).get(idx).cloned())
+            .and_then(|row| {
+                let toggles_workspace =
+                    row.is_workspace && state.navigator_row_caret_at(mouse.column);
+                (!toggles_workspace).then_some(row.target)
+            })
+    } else {
+        None
+    };
     let action = state.handle_mouse(&mut runtimes, mouse);
     let mut action = match action {
         Some(MouseAction::NewWorkspace) => Some(ClientSidebarAction::NewWorkspace),
@@ -249,6 +282,9 @@ pub(crate) fn handle_client_sidebar_mouse(
         }
         _ => None,
     };
+    if action.is_none() && state.mode == Mode::Terminal {
+        action = navigator_target.map(client_sidebar_navigator_action);
+    }
     if previous_settings_section != crate::app::state::SettingsSection::Integrations
         && state.settings.section == crate::app::state::SettingsSection::Integrations
     {
@@ -285,6 +321,38 @@ fn close_client_sidebar_workspace(state: &mut AppState) -> Option<ClientSidebarA
         state.mode = Mode::Terminal;
         Some(ClientSidebarAction::CloseWorkspace { ws_idx })
     }
+}
+
+fn client_sidebar_relative_workspace(
+    state: &AppState,
+    delta: isize,
+) -> Option<ClientSidebarAction> {
+    let order = state.visible_workspace_order();
+    if order.is_empty() {
+        return None;
+    }
+    let current = state.active.or(Some(state.selected))?;
+    let current_position = order.iter().position(|idx| *idx == current).unwrap_or(0);
+    let next_position = (current_position as isize + delta).rem_euclid(order.len() as isize);
+    order
+        .get(next_position as usize)
+        .copied()
+        .map(|ws_idx| ClientSidebarAction::FocusWorkspace { ws_idx })
+}
+
+fn client_sidebar_indexed_workspace(
+    state: &AppState,
+    key: &TerminalKey,
+    prefix: bool,
+) -> Option<ClientSidebarAction> {
+    state
+        .keybinds
+        .switch_workspace
+        .iter()
+        .filter(|binding| binding.trigger.is_prefix() == prefix)
+        .find_map(|binding| binding.matched_index(key))
+        .and_then(|position| state.workspace_at_visible_position(position))
+        .map(|ws_idx| ClientSidebarAction::FocusWorkspace { ws_idx })
 }
 
 fn handle_client_sidebar_action_key(
@@ -327,6 +395,25 @@ fn handle_client_sidebar_action_key(
         state.integration_recommendations = crate::integration::integration_recommendations();
         settings::open_settings(state);
         return None;
+    }
+    if matches(&state.keybinds.goto) {
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        state.open_navigator_from(&runtimes);
+        return Some(ClientSidebarAction::Redraw);
+    }
+    if matches(&state.keybinds.workspace_picker) {
+        state.mobile_switcher_scroll = 0;
+        state.mode = Mode::Navigate;
+        return Some(ClientSidebarAction::Redraw);
+    }
+    if matches(&state.keybinds.previous_workspace) {
+        return client_sidebar_relative_workspace(state, -1);
+    }
+    if matches(&state.keybinds.next_workspace) {
+        return client_sidebar_relative_workspace(state, 1);
+    }
+    if let Some(action) = client_sidebar_indexed_workspace(state, key, prefix) {
+        return Some(action);
     }
     None
 }
@@ -401,6 +488,64 @@ pub(crate) fn handle_client_sidebar_key(
             }
             action
         }
+        Mode::Navigator => {
+            let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+            let target = (key_event.code == KeyCode::Enter)
+                .then(|| {
+                    state
+                        .navigator_rows_from(&runtimes)
+                        .get(state.navigator.selected)
+                        .map(|row| row.target.clone())
+                })
+                .flatten();
+            modal::handle_navigator_key(state, &runtimes, key_event);
+            if state.mode == Mode::Terminal {
+                target.map(client_sidebar_navigator_action)
+            } else {
+                None
+            }
+        }
+        Mode::Navigate => {
+            if state.is_prefix_key(&key) || key_event.code == KeyCode::Esc {
+                state.mode = Mode::Terminal;
+                None
+            } else if state
+                .keybinds
+                .navigate
+                .workspace_up
+                .matches_direct_key(&key)
+            {
+                state.move_selected_workspace_by_visible_delta(-1);
+                None
+            } else if state
+                .keybinds
+                .navigate
+                .workspace_down
+                .matches_direct_key(&key)
+            {
+                state.move_selected_workspace_by_visible_delta(1);
+                None
+            } else if key_event.code == KeyCode::Enter {
+                let ws_idx = state.selected;
+                state.mode = Mode::Terminal;
+                Some(ClientSidebarAction::FocusWorkspace { ws_idx })
+            } else if let KeyCode::Char(digit @ '1'..='9') = key_event.code {
+                let position = (digit as usize) - ('1' as usize);
+                let action = state
+                    .workspace_at_visible_position(position)
+                    .map(|ws_idx| ClientSidebarAction::FocusWorkspace { ws_idx });
+                if action.is_some() {
+                    state.mode = Mode::Terminal;
+                }
+                action
+            } else {
+                let action = handle_client_sidebar_action_key(state, &key, true);
+                if action.is_some() && state.mode == Mode::Navigate {
+                    state.mode = Mode::Terminal;
+                }
+                action
+            }
+        }
         Mode::Prefix => {
             if key.kind != crossterm::event::KeyEventKind::Press
                 || matches!(key_event.code, KeyCode::Modifier(_))
@@ -456,6 +601,11 @@ pub(crate) fn handle_client_sidebar_text(state: &mut AppState, text: &str) -> bo
         }
         Mode::KeybindHelp => {
             modal::insert_keybind_help_query_text(state, text);
+            true
+        }
+        Mode::Navigator => {
+            let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+            modal::insert_navigator_search_text(state, &runtimes, text);
             true
         }
         Mode::Terminal => false,
