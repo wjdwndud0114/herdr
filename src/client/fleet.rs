@@ -916,16 +916,12 @@ fn route_raw_input(
         state.host.remote_image_paste_key,
     ) {
         if let Some(image) = crate::platform::read_clipboard_image() {
-            if let Some(writer) = state.instances[state.active].writer.as_mut() {
-                super::write_remote_image_to_server(writer, image, "clipboard paste")?;
-            }
+            write_active_remote_image(state, image, "clipboard paste");
             return Ok(());
         }
     }
     if let Some(image) = super::read_image_file_from_terminal_drop(&data, active_is_remote) {
-        if let Some(writer) = state.instances[state.active].writer.as_mut() {
-            super::write_remote_image_to_server(writer, image, "file drop")?;
-        }
+        write_active_remote_image(state, image, "file drop");
         return Ok(());
     }
 
@@ -1065,16 +1061,22 @@ fn persist_fleet_presentation(state: &mut FleetState) {
 }
 
 fn broadcast_input(state: &mut FleetState, data: &[u8]) -> Result<(), ClientError> {
-    for instance in &mut state.instances {
-        if let Some(writer) = &mut instance.writer {
-            super::write_to_server(
-                writer,
-                &ClientMessage::Input {
-                    data: data.to_vec(),
-                },
-            )
-            .map_err(ClientError::ConnectionLost)?;
+    let mut disconnected = Vec::new();
+    for (index, instance) in state.instances.iter_mut().enumerate() {
+        let Some(writer) = &mut instance.writer else {
+            continue;
+        };
+        if let Err(err) = super::write_to_server(
+            writer,
+            &ClientMessage::Input {
+                data: data.to_vec(),
+            },
+        ) {
+            disconnected.push((index, err));
         }
+    }
+    for (index, err) in disconnected {
+        mark_content_stream_disconnected(state, index, err);
     }
     Ok(())
 }
@@ -1151,10 +1153,11 @@ fn resize_content_streams(state: &mut FleetState, cols: u16, rows: u16) -> Resul
     let content = state.sidebar.view.terminal_area;
     let content_cols = content.width.max(2);
     let content_rows = content.height.max(1);
-    for instance in &mut state.instances {
+    let mut disconnected = Vec::new();
+    for (index, instance) in state.instances.iter_mut().enumerate() {
         instance.frame = None;
         if let Some(writer) = &mut instance.writer {
-            super::write_to_server(
+            if let Err(err) = super::write_to_server(
                 writer,
                 &ClientMessage::Resize {
                     cols: content_cols,
@@ -1162,18 +1165,51 @@ fn resize_content_streams(state: &mut FleetState, cols: u16, rows: u16) -> Resul
                     cell_width_px: state.cell_width_px,
                     cell_height_px: state.cell_height_px,
                 },
-            )
-            .map_err(ClientError::ConnectionLost)?;
+            ) {
+                disconnected.push((index, err));
+            }
         }
+    }
+    for (index, err) in disconnected {
+        mark_content_stream_disconnected(state, index, err);
     }
     Ok(())
 }
 
 fn write_active(state: &mut FleetState, message: ClientMessage) -> Result<(), ClientError> {
-    let Some(writer) = state.instances[state.active].writer.as_mut() else {
+    let index = state.active;
+    let Some(writer) = state.instances[index].writer.as_mut() else {
         return Ok(());
     };
-    super::write_to_server(writer, &message).map_err(ClientError::ConnectionLost)
+    if let Err(err) = super::write_to_server(writer, &message) {
+        mark_content_stream_disconnected(state, index, err);
+    }
+    Ok(())
+}
+
+fn write_active_remote_image(
+    state: &mut FleetState,
+    image: crate::platform::ClipboardImage,
+    source: &'static str,
+) {
+    let index = state.active;
+    let Some(writer) = state.instances[index].writer.as_mut() else {
+        return;
+    };
+    if let Err(err) = super::write_remote_image_to_server(writer, image, source) {
+        mark_content_stream_disconnected(state, index, io::Error::other(err.to_string()));
+    }
+}
+
+fn mark_content_stream_disconnected(state: &mut FleetState, index: usize, err: io::Error) {
+    let Some(instance) = state.instances.get_mut(index) else {
+        return;
+    };
+    tracing::debug!(instance = %instance.id, %err, "fleet content stream write failed");
+    instance.error = Some("disconnected".to_string());
+    instance.writer = None;
+    instance.frame = None;
+    state.host.request_repaint();
 }
 
 fn mouse_kind(kind: MouseEventKind) -> Option<ClientMouseKind> {
