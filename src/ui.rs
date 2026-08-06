@@ -103,6 +103,12 @@ use crate::app::state::ViewLayout;
 use crate::app::{AppState, Mode};
 use crate::terminal::TerminalRuntimeRegistry;
 
+/// Render the standard desktop sidebar for a client-owned aggregate view.
+pub(crate) fn render_client_sidebar(app: &AppState, frame: &mut Frame) {
+    let terminal_runtimes = TerminalRuntimeRegistry::new();
+    render_sidebar(app, &terminal_runtimes, frame, app.view.sidebar_rect);
+}
+
 const COLLAPSED_WIDTH: u16 = 4; // num + space + dot + separator
 
 /// Compute view geometry and reconcile pane sizes.

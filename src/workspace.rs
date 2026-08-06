@@ -8,9 +8,7 @@ use ratatui::layout::Direction;
 use tokio::sync::{mpsc, Notify};
 
 use crate::events::AppEvent;
-use crate::layout::PaneId;
-#[cfg(test)]
-use crate::layout::TileLayout;
+use crate::layout::{PaneId, TileLayout};
 use crate::pane::{PaneLaunchEnv, PaneState};
 use crate::render_signal::RenderSignal;
 use crate::terminal::{TerminalId, TerminalRuntime, TerminalRuntimeRegistry, TerminalState};
@@ -218,6 +216,87 @@ impl DerefMut for Workspace {
 }
 
 impl Workspace {
+    /// Build a runtime-free workspace that can be fed through the normal sidebar renderer.
+    pub(crate) fn sidebar_placeholder(
+        id: String,
+        name: String,
+        branch: Option<String>,
+        pane_terminals: Vec<(TerminalId, bool)>,
+        focused_pane_idx: Option<usize>,
+    ) -> (Self, Vec<PaneId>) {
+        let (events, _) = mpsc::channel(64);
+        let render_notify = Arc::new(Notify::new());
+        let render_dirty = Arc::new(RenderSignal::new());
+        let identity_cwd = PathBuf::from("/");
+        let mut pane_terminals = pane_terminals;
+        if pane_terminals.is_empty() {
+            pane_terminals.push((TerminalId::alloc(), true));
+        }
+
+        let (mut layout, root_id) = TileLayout::new();
+        let mut panes = HashMap::new();
+        let mut pane_ids = vec![root_id];
+        let mut public_pane_numbers = HashMap::new();
+
+        let (root_terminal_id, root_seen) = pane_terminals[0].clone();
+        let mut root_pane = PaneState::new(root_terminal_id);
+        root_pane.seen = root_seen;
+        panes.insert(root_id, root_pane);
+        public_pane_numbers.insert(root_id, 1);
+
+        for (idx, (terminal_id, seen)) in pane_terminals.into_iter().enumerate().skip(1) {
+            let pane_id = layout.split_focused(Direction::Vertical);
+            let mut pane = PaneState::new(terminal_id);
+            pane.seen = seen;
+            panes.insert(pane_id, pane);
+            pane_ids.push(pane_id);
+            public_pane_numbers.insert(pane_id, idx + 1);
+        }
+
+        if let Some(focused_pane) = focused_pane_idx.and_then(|idx| pane_ids.get(idx).copied()) {
+            layout.focus_pane(focused_pane);
+        }
+
+        let tab = Tab {
+            custom_name: None,
+            number: 1,
+            root_pane: root_id,
+            layout,
+            panes,
+            #[cfg(test)]
+            runtimes: HashMap::new(),
+            zoomed: false,
+            events,
+            render_notify,
+            render_dirty,
+        };
+
+        (
+            Self {
+                id,
+                custom_name: Some(name),
+                identity_cwd: identity_cwd.clone(),
+                cached_identity_cwd: identity_cwd.clone(),
+                cached_auto_label: fallback_label_from_cwd(&identity_cwd),
+                cached_git_status_key: identity_cwd,
+                cached_git_branch: branch,
+                cached_git_ahead_behind: None,
+                cached_git_space: None,
+                worktree_space: None,
+                metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
+                metadata_token_sequences: HashMap::new(),
+                public_pane_numbers,
+                next_public_pane_number: pane_ids.len() + 1,
+                next_public_tab_number: 2,
+                tabs: vec![tab],
+                active_tab: 0,
+                #[cfg(test)]
+                test_runtimes: HashMap::new(),
+            },
+            pane_ids,
+        )
+    }
+
     fn adjust_active_tab_after_removal(&mut self, removed_idx: usize) {
         if self.tabs.is_empty() {
             self.active_tab = 0;

@@ -1779,10 +1779,9 @@ pub fn key_matches(
 // Test helpers
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
 impl AppState {
-    /// Create an AppState for testing — no channels, no PTYs.
-    pub fn test_new() -> Self {
+    /// Create an AppState for client-owned shell rendering — no channels or PTYs.
+    pub(crate) fn empty_for_client_rendering() -> Self {
         Self {
             terminals: std::collections::HashMap::new(),
             direct_attach_resize_locks: std::collections::HashSet::new(),
@@ -1951,6 +1950,14 @@ impl AppState {
             session_dirty: false,
             terminal_runtime_shutdowns: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+impl AppState {
+    /// Create an AppState for testing — no channels, no PTYs.
+    pub fn test_new() -> Self {
+        Self::empty_for_client_rendering()
     }
 
     /// Populate missing `TerminalState` entries for every pane so tests that
