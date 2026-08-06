@@ -423,6 +423,15 @@ pub(crate) fn handle_client_sidebar_key(
     key: TerminalKey,
 ) -> ClientSidebarInput {
     let key_event = key.as_key_event();
+    if key.kind == crossterm::event::KeyEventKind::Release
+        && !matches!(state.mode, Mode::Terminal | Mode::Prefix)
+    {
+        // Enhanced keyboard protocols can deliver the prefix key's release
+        // after its follow-up press. Once the fleet shell owns a command mode,
+        // that delayed release must not be interpreted as another prefix key
+        // and immediately close the mode.
+        return ClientSidebarInput::Consumed(None);
+    }
     let action = match state.mode {
         Mode::RenameWorkspace => {
             if let Some(action) = modal::modal_action_from_key(&key_event, modal::RENAME_ACTIONS) {
