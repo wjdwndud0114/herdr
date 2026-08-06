@@ -9,11 +9,20 @@ pub(crate) fn run_remote_client_bridge() -> io::Result<()> {
     ensure_remote_server_running()?;
 
     let socket_path = crate::server::socket_paths::client_socket_path();
+    run_socket_bridge(socket_path, "client")
+}
+
+pub(crate) fn run_remote_api_bridge() -> io::Result<()> {
+    ensure_remote_server_running()?;
+    run_socket_bridge(crate::api::socket_path(), "API")
+}
+
+fn run_socket_bridge(socket_path: std::path::PathBuf, kind: &str) -> io::Result<()> {
     let stream = UnixStream::connect(&socket_path).map_err(|err| {
         io::Error::new(
             err.kind(),
             format!(
-                "failed to connect to remote Herdr client socket {}: {err}",
+                "failed to connect to remote Herdr {kind} socket {}: {err}",
                 socket_path.display()
             ),
         )

@@ -63,6 +63,15 @@ pub enum ClientLaunchMode {
     TerminalAttach,
 }
 
+/// Portion of the app requested by a presentation client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AppSurface {
+    /// The complete server-owned Herdr interface.
+    Full,
+    /// Workspace content without server-owned navigation chrome.
+    Content,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientKeyKind {
     Press,
@@ -430,7 +439,6 @@ pub enum ClientMessage {
         /// Replace an existing writable controller for this terminal.
         takeover: bool,
     },
-
     /// Result of the one armed Herdr-owned direct Kitty transmission.
     GraphicsTransmissionResult {
         transfer_id: u64,
@@ -449,6 +457,9 @@ pub enum ClientMessage {
 
     /// The direct command was written and flushed; terminal response timing starts now.
     GraphicsTransmissionStarted { transfer_id: u64, image_id: u32 },
+
+    /// Change the app presentation surface for this connection.
+    SetAppSurface { surface: AppSurface },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
