@@ -1601,13 +1601,31 @@ fn confirm_remote_install(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+enum RemoteBridgeEndpoint {
+    Client,
+    Api,
+}
+
 fn remote_bridge_command(remote_herdr: &RemoteHerdr, session_name: &str) -> String {
+    remote_endpoint_bridge_command(remote_herdr, session_name, RemoteBridgeEndpoint::Client)
+}
+
+fn remote_endpoint_bridge_command(
+    remote_herdr: &RemoteHerdr,
+    session_name: &str,
+    endpoint: RemoteBridgeEndpoint,
+) -> String {
     let mut command = format!("exec {}", remote_herdr.shell_path);
     if session_name != crate::session::DEFAULT_SESSION_NAME {
         command.push_str(" --session ");
         command.push_str(&shell_quote(session_name));
     }
-    command.push_str(" remote-client-bridge");
+    command.push(' ');
+    command.push_str(match endpoint {
+        RemoteBridgeEndpoint::Client => "remote-client-bridge",
+        RemoteBridgeEndpoint::Api => "remote-api-bridge",
+    });
     command
 }
 
@@ -1660,6 +1678,24 @@ impl SshStdioBridge {
         session_name: String,
         ssh_options: Option<&ManagedSshOptions>,
     ) -> io::Result<Self> {
+        Self::start_endpoint(
+            target,
+            remote_herdr,
+            local_socket,
+            session_name,
+            ssh_options,
+            RemoteBridgeEndpoint::Client,
+        )
+    }
+
+    fn start_endpoint(
+        target: String,
+        remote_herdr: RemoteHerdr,
+        local_socket: PathBuf,
+        session_name: String,
+        ssh_options: Option<&ManagedSshOptions>,
+        endpoint: RemoteBridgeEndpoint,
+    ) -> io::Result<Self> {
         crate::ipc::prepare_socket_path(&local_socket, |path| {
             format!("remote bridge is already listening at {}", path.display())
         })?;
@@ -1690,6 +1726,7 @@ impl SshStdioBridge {
                             &session_name,
                             thread_ssh_options.as_ref(),
                             &thread_stop,
+                            endpoint,
                         ) {
                             eprintln!("herdr: remote bridge failed: {err}");
                         }
@@ -1725,6 +1762,74 @@ impl Drop for SshStdioBridge {
         #[cfg(windows)]
         let _ = crate::ipc::remove_socket_file_if_owned(&self.local_socket, &self.socket_identity);
     }
+}
+
+/// Paired client/API tunnels used by the local multi-instance presentation client.
+pub(crate) struct FleetRemoteBridge {
+    client: SshStdioBridge,
+    api: SshStdioBridge,
+    // Keep the managed SSH config and control socket alive until both tunnels stop.
+    _remote_ssh: RemoteSsh,
+}
+
+impl FleetRemoteBridge {
+    pub(crate) fn client_socket(&self) -> &Path {
+        &self.client.local_socket
+    }
+
+    pub(crate) fn api_socket(&self) -> &Path {
+        &self.api.local_socket
+    }
+}
+
+pub(crate) fn start_fleet_remote_bridge(
+    target: &str,
+    session: Option<&str>,
+    instance_id: &str,
+) -> io::Result<FleetRemoteBridge> {
+    validate_remote_target(target)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    let session_name = session.unwrap_or(crate::session::DEFAULT_SESSION_NAME);
+    let manage_ssh_config = crate::config::Config::load()
+        .config
+        .remote
+        .manage_ssh_config;
+    let remote_ssh = RemoteSsh::new(target.to_string(), manage_ssh_config);
+    let prepared_remote = prepare_remote_herdr(&remote_ssh, false)?;
+    ensure_remote_server_ready(
+        &remote_ssh,
+        &prepared_remote.remote_herdr,
+        prepared_remote.installed_or_replaced,
+        prepared_remote.stop_after_install_approved,
+        false,
+    )?;
+
+    let client_socket =
+        local_forward_socket_path(target, &format!("{session_name}-{instance_id}-client"));
+    let api_socket =
+        local_forward_socket_path(target, &format!("{session_name}-{instance_id}-api"));
+    let client = SshStdioBridge::start_endpoint(
+        target.to_string(),
+        prepared_remote.remote_herdr.clone(),
+        client_socket,
+        session_name.to_string(),
+        remote_ssh.options(),
+        RemoteBridgeEndpoint::Client,
+    )?;
+    let api = SshStdioBridge::start_endpoint(
+        target.to_string(),
+        prepared_remote.remote_herdr,
+        api_socket,
+        session_name.to_string(),
+        remote_ssh.options(),
+        RemoteBridgeEndpoint::Api,
+    )?;
+
+    Ok(FleetRemoteBridge {
+        client,
+        api,
+        _remote_ssh: remote_ssh,
+    })
 }
 
 fn ssh_config_quote(path: &str) -> String {
@@ -1791,13 +1896,18 @@ fn bridge_connection(
     session_name: &str,
     ssh_options: Option<&ManagedSshOptions>,
     _bridge_stop: &Arc<AtomicBool>,
+    endpoint: RemoteBridgeEndpoint,
 ) -> io::Result<()> {
     let mut command = Command::new("ssh");
     apply_managed_ssh_options(&mut command, ssh_options);
     command
         .arg("-T")
         .arg(target)
-        .arg(remote_bridge_command(remote_herdr, session_name))
+        .arg(remote_endpoint_bridge_command(
+            remote_herdr,
+            session_name,
+            endpoint,
+        ))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
@@ -1846,13 +1956,18 @@ fn bridge_connection(
     session_name: &str,
     ssh_options: Option<&ManagedSshOptions>,
     bridge_stop: &Arc<AtomicBool>,
+    endpoint: RemoteBridgeEndpoint,
 ) -> io::Result<()> {
     let mut command = Command::new("ssh");
     apply_managed_ssh_options(&mut command, ssh_options);
     command
         .arg("-T")
         .arg(target)
-        .arg(remote_bridge_command(remote_herdr, session_name))
+        .arg(remote_endpoint_bridge_command(
+            remote_herdr,
+            session_name,
+            endpoint,
+        ))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());

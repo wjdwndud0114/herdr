@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Current protocol version. Bumped when wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 19;
+pub const PROTOCOL_VERSION: u32 = 20;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
@@ -59,6 +59,15 @@ pub enum ClientLaunchMode {
     App,
     /// Direct terminal attach client.
     TerminalAttach,
+}
+
+/// Portion of the app requested by a presentation client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AppSurface {
+    /// The complete server-owned Herdr interface.
+    Full,
+    /// Workspace content without server-owned navigation chrome.
+    Content,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -428,6 +437,9 @@ pub enum ClientMessage {
         /// Replace an existing writable controller for this terminal.
         takeover: bool,
     },
+
+    /// Change the app presentation surface for this connection.
+    SetAppSurface { surface: AppSurface },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
