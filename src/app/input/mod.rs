@@ -120,6 +120,10 @@ pub(crate) enum ClientSidebarAction {
 
 pub(crate) enum ClientSidebarInput {
     Forward,
+    /// Fleet navigation owns the visible picker, but this binding belongs to
+    /// the active content server. Replay the original prefix and follow-up key
+    /// there so the server executes the same native action as a normal client.
+    ForwardWithPrefix,
     /// The prefix was already forwarded to the active content server, but the
     /// follow-up key belongs to the aggregate fleet shell. Cancel the server's
     /// pending prefix before applying the local action.
@@ -340,6 +344,28 @@ fn client_sidebar_relative_workspace(
         .map(|ws_idx| ClientSidebarAction::FocusWorkspace { ws_idx })
 }
 
+fn client_sidebar_agent_at(state: &AppState, position: usize) -> Option<ClientSidebarAction> {
+    crate::ui::agent_panel_entries(state)
+        .get(position)
+        .map(|entry| ClientSidebarAction::FocusPane {
+            ws_idx: entry.ws_idx,
+            pane_id: entry.pane_id,
+        })
+}
+
+fn client_sidebar_relative_agent(state: &AppState, delta: isize) -> Option<ClientSidebarAction> {
+    let entries = crate::ui::agent_panel_entries(state);
+    if entries.is_empty() {
+        return None;
+    }
+    let current = entries
+        .iter()
+        .position(|entry| state.is_active_pane(entry.ws_idx, entry.tab_idx, entry.pane_id))
+        .unwrap_or(0);
+    let next = (current as isize + delta).rem_euclid(entries.len() as isize) as usize;
+    client_sidebar_agent_at(state, next)
+}
+
 fn client_sidebar_indexed_workspace(
     state: &AppState,
     key: &TerminalKey,
@@ -367,6 +393,25 @@ fn handle_client_sidebar_action_key(
             binding.matches_direct_key(key)
         }
     };
+
+    let native_action = if prefix {
+        navigate::client_prefix_navigation_action(state, key)
+    } else {
+        navigate::terminal_direct_non_indexed_navigation_action(state, key)
+            .or_else(|| navigate::terminal_direct_indexed_navigation_action(state, key))
+    };
+    match native_action {
+        Some(navigate::NavigateAction::PreviousAgent) => {
+            return client_sidebar_relative_agent(state, -1);
+        }
+        Some(navigate::NavigateAction::NextAgent) => {
+            return client_sidebar_relative_agent(state, 1);
+        }
+        Some(navigate::NavigateAction::FocusAgent(index)) => {
+            return client_sidebar_agent_at(state, index);
+        }
+        _ => {}
+    }
 
     if matches(&state.keybinds.detach) {
         return Some(ClientSidebarAction::Detach);
@@ -547,6 +592,12 @@ pub(crate) fn handle_client_sidebar_key(
                     state.mode = Mode::Terminal;
                 }
                 action
+            } else if navigate::client_prefix_navigation_action(state, &key)
+                .is_some_and(navigate::client_action_runs_on_active_content)
+                || navigate::client_prefix_custom_command_matches(state, &key)
+            {
+                state.mode = Mode::Terminal;
+                return ClientSidebarInput::ForwardWithPrefix;
             } else {
                 let action = handle_client_sidebar_action_key(state, &key, true);
                 if action.is_some() && state.mode == Mode::Navigate {

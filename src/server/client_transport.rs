@@ -291,6 +291,7 @@ pub(crate) enum ServerEvent {
         render_encoding: RenderEncoding,
         keybindings: Option<Box<crate::config::LiveKeybindConfig>>,
         direct_attach_requested: bool,
+        app_surface: crate::protocol::AppSurface,
         writer: ClientWriter,
     },
     /// A client sent an input message.
@@ -520,6 +521,7 @@ pub(crate) fn handle_client_handshake(
         render_encoding,
         keybindings,
         direct_attach_requested,
+        app_surface,
     ) = match hello {
         ClientMessage::Hello {
             version,
@@ -530,6 +532,7 @@ pub(crate) fn handle_client_handshake(
             requested_encoding,
             keybindings,
             launch_mode,
+            app_surface,
         } => {
             // Version check.
             match protocol::check_client_version(version) {
@@ -569,6 +572,7 @@ pub(crate) fn handle_client_handshake(
                 requested_encoding,
                 keybindings,
                 launch_mode == ClientLaunchMode::TerminalAttach,
+                app_surface,
             )
         }
         _ => {
@@ -623,6 +627,7 @@ pub(crate) fn handle_client_handshake(
         render_encoding,
         keybindings,
         direct_attach_requested,
+        app_surface,
         writer,
     });
 
@@ -1179,6 +1184,7 @@ new_tab = "ctrl+notakey"
                 requested_encoding: RenderEncoding::TerminalAnsi,
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::App,
+                app_surface: crate::protocol::AppSurface::Full,
             },
         )
         .expect("write hello");
@@ -1211,6 +1217,7 @@ new_tab = "ctrl+notakey"
                 render_encoding,
                 keybindings,
                 direct_attach_requested,
+                app_surface,
                 writer,
             } => {
                 assert_eq!(client_id, 42);
@@ -1219,6 +1226,7 @@ new_tab = "ctrl+notakey"
                 assert_eq!(render_encoding, RenderEncoding::TerminalAnsi);
                 assert!(keybindings.is_none());
                 assert!(!direct_attach_requested);
+                assert_eq!(app_surface, crate::protocol::AppSurface::Full);
                 drop(writer);
             }
             other => panic!("expected ClientConnected, got {other:?}"),
@@ -1254,6 +1262,7 @@ new_tab = "ctrl+notakey"
                 requested_encoding: RenderEncoding::TerminalAnsi,
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::TerminalAttach,
+                app_surface: crate::protocol::AppSurface::Full,
             },
         )
         .expect("write hello");

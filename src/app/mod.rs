@@ -1580,6 +1580,32 @@ impl App {
     }
 }
 
+/// Build the same presentation state as a normal app without restoring or
+/// owning any server runtime. Client-side compositors use this instead of
+/// maintaining a second, manually copied view of `Config`.
+pub(crate) fn client_shell_state_from_config(
+    config: &Config,
+    config_diagnostic: Option<String>,
+) -> AppState {
+    let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut state = App::new(
+        config,
+        true,
+        config_diagnostic,
+        api_rx,
+        crate::api::EventHub::default(),
+    )
+    .state;
+    state.workspaces.clear();
+    state.terminals.clear();
+    state.active = None;
+    state.selected = 0;
+    state.mode = state::Mode::Terminal;
+    state.release_notes = None;
+    state.product_announcement = None;
+    state
+}
+
 // ---------------------------------------------------------------------------
 // Input routing for headless server mode
 // ---------------------------------------------------------------------------

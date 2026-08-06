@@ -33,11 +33,29 @@ pub(crate) struct RemoteInstance {
     pub(crate) enabled: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct FleetRegistry {
     version: u32,
     #[serde(default)]
     pub(crate) instances: Vec<RemoteInstance>,
+    #[serde(default, skip_serializing_if = "FleetPresentation::is_default")]
+    presentation: FleetPresentation,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub(crate) struct FleetPresentation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) sidebar_width: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) sidebar_section_split: Option<f32>,
+    #[serde(default, skip_serializing_if = "std::collections::HashSet::is_empty")]
+    pub(crate) collapsed_space_keys: std::collections::HashSet<String>,
+}
+
+impl FleetPresentation {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 impl Default for FleetRegistry {
@@ -45,11 +63,20 @@ impl Default for FleetRegistry {
         Self {
             version: REGISTRY_VERSION,
             instances: Vec::new(),
+            presentation: FleetPresentation::default(),
         }
     }
 }
 
 impl FleetRegistry {
+    pub(crate) fn presentation(&self) -> &FleetPresentation {
+        &self.presentation
+    }
+
+    pub(crate) fn set_presentation(&mut self, presentation: FleetPresentation) {
+        self.presentation = presentation;
+    }
+
     pub(crate) fn enabled_instances(&self) -> impl Iterator<Item = &RemoteInstance> {
         self.instances.iter().filter(|instance| instance.enabled)
     }

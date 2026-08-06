@@ -205,6 +205,7 @@ pub(crate) struct SidebarPlaceholderTab {
     pub(crate) label: Option<String>,
     pub(crate) number: usize,
     pub(crate) pane_terminals: Vec<(TerminalId, bool)>,
+    pub(crate) pane_ids: Vec<PaneId>,
     pub(crate) focused_pane_idx: Option<usize>,
 }
 
@@ -225,29 +226,6 @@ impl DerefMut for Workspace {
 }
 
 impl Workspace {
-    /// Build a runtime-free workspace that can be fed through the normal sidebar renderer.
-    pub(crate) fn sidebar_placeholder(
-        id: String,
-        name: String,
-        branch: Option<String>,
-        pane_terminals: Vec<(TerminalId, bool)>,
-        focused_pane_idx: Option<usize>,
-    ) -> (Self, Vec<PaneId>) {
-        let (workspace, mut tab_pane_ids) = Self::sidebar_placeholder_with_tabs(
-            id,
-            name,
-            branch,
-            vec![SidebarPlaceholderTab {
-                label: None,
-                number: 1,
-                pane_terminals,
-                focused_pane_idx,
-            }],
-            0,
-        );
-        (workspace, tab_pane_ids.pop().unwrap_or_default())
-    }
-
     pub(crate) fn sidebar_placeholder_with_tabs(
         id: String,
         name: String,
@@ -264,6 +242,7 @@ impl Workspace {
                 label: None,
                 number: 1,
                 pane_terminals: Vec::new(),
+                pane_ids: Vec::new(),
                 focused_pane_idx: None,
             });
         }
@@ -278,9 +257,14 @@ impl Workspace {
             if placeholder.pane_terminals.is_empty() {
                 placeholder.pane_terminals.push((TerminalId::alloc(), true));
             }
-            let (mut layout, root_id) = TileLayout::new();
+            let pane_count = placeholder.pane_terminals.len();
+            let pane_ids = if placeholder.pane_ids.len() == pane_count {
+                placeholder.pane_ids
+            } else {
+                (0..pane_count).map(|_| PaneId::alloc()).collect()
+            };
+            let root_id = pane_ids[0];
             let mut panes = HashMap::new();
-            let mut pane_ids = vec![root_id];
 
             let (root_terminal_id, root_seen) = placeholder.pane_terminals[0].clone();
             let mut root_pane = PaneState::new(root_terminal_id);
@@ -289,24 +273,33 @@ impl Workspace {
             public_pane_numbers.insert(root_id, next_public_pane_number);
             next_public_pane_number += 1;
 
-            for (terminal_id, seen) in placeholder.pane_terminals.into_iter().skip(1) {
-                let Some(pane_id) = layout.split_pane(root_id, Direction::Vertical, 0.5) else {
-                    continue;
-                };
+            for ((terminal_id, seen), pane_id) in placeholder
+                .pane_terminals
+                .into_iter()
+                .skip(1)
+                .zip(pane_ids.iter().copied().skip(1))
+            {
                 let mut pane = PaneState::new(terminal_id);
                 pane.seen = seen;
                 panes.insert(pane_id, pane);
-                pane_ids.push(pane_id);
                 public_pane_numbers.insert(pane_id, next_public_pane_number);
                 next_public_pane_number += 1;
             }
 
-            if let Some(focused_pane) = placeholder
+            let focused_pane = placeholder
                 .focused_pane_idx
                 .and_then(|idx| pane_ids.get(idx).copied())
-            {
-                layout.focus_pane(focused_pane);
-            }
+                .unwrap_or(root_id);
+            let layout_root = pane_ids.iter().copied().skip(1).fold(
+                crate::layout::Node::Pane(root_id),
+                |first, pane_id| crate::layout::Node::Split {
+                    direction: Direction::Vertical,
+                    ratio: 0.5,
+                    first: Box::new(first),
+                    second: Box::new(crate::layout::Node::Pane(pane_id)),
+                },
+            );
+            let layout = TileLayout::from_saved(layout_root, focused_pane);
 
             next_public_tab_number = next_public_tab_number.max(placeholder.number + 1);
             tabs.push(Tab {

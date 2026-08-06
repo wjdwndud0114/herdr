@@ -1,7 +1,7 @@
 use std::collections::HashMap;
-use std::io::{self, Write as _};
+use std::io::{self, BufRead as _, BufReader, Write as _};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -18,13 +18,15 @@ use crate::api::schema::{
     TabTarget, WorkspaceCreateParams, WorkspaceRenameParams, WorkspaceTarget,
 };
 use crate::ipc::LocalStream;
+use crate::platform::PrefixInputSource;
 use crate::protocol::{
     self, AppSurface, CellData, ClientInputEvent, ClientMessage, ClientMouseButton,
     ClientMouseKind, FrameData, RenderEncoding, ServerMessage, MAX_FRAME_SIZE,
+    MAX_GRAPHICS_FRAME_SIZE,
 };
 
 const LOCAL_INSTANCE_ID: &str = "local";
-const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(750);
+const RECONNECT_INTERVAL: Duration = Duration::from_millis(750);
 
 pub(super) fn is_enabled() -> bool {
     crate::fleet::load().enabled_instances().next().is_some()
@@ -38,6 +40,17 @@ struct Instance {
     snapshot: Option<SessionSnapshot>,
     frame: Option<FrameData>,
     error: Option<String>,
+    mouse_capture: bool,
+    keyboard_report_all: bool,
+    prefix_input_active: bool,
+    window_title: Option<String>,
+    request_tx: Option<std::sync::mpsc::Sender<ApiCommand>>,
+    client_socket: Option<PathBuf>,
+}
+
+struct ApiCommand {
+    id: &'static str,
+    method: Method,
 }
 
 enum FleetEvent {
@@ -69,10 +82,17 @@ struct FleetState {
     workspace_routes: HashMap<usize, SidebarHit>,
     tab_routes: HashMap<(usize, usize), SidebarHit>,
     pane_routes: HashMap<(usize, crate::layout::PaneId), SidebarHit>,
-    blit_encoder: crate::protocol::render_ansi::BlitEncoder,
-    repaint_pending: bool,
+    projected_terminal_ids: HashMap<String, crate::terminal::TerminalId>,
+    projected_pane_ids: HashMap<String, crate::layout::PaneId>,
     quit_requested: bool,
-    sound_config: crate::config::SoundConfig,
+    host: super::ClientState,
+    host_mouse_capture: Arc<AtomicBool>,
+    prefix_input_source: crate::platform::RealPrefixInputSource,
+    pending_prefix_bytes: Vec<u8>,
+    cell_width_px: u32,
+    cell_height_px: u32,
+    last_reconnect_attempt: Instant,
+    working_animation_frame: u8,
     visual: FleetVisualConfig,
 }
 
@@ -87,7 +107,6 @@ struct FleetVisualConfig {
     sidebar_spaces: crate::config::SpacesSidebarConfig,
     sidebar_min_width: u16,
     sidebar_max_width: u16,
-    sidebar_start_collapsed: bool,
     sidebar_collapsed_mode: crate::config::SidebarCollapsedModeConfig,
     confirm_close: bool,
     show_agent_labels_on_pane_borders: bool,
@@ -97,6 +116,11 @@ struct FleetVisualConfig {
     prefix_code: crossterm::event::KeyCode,
     prefix_mods: crossterm::event::KeyModifiers,
     mouse_capture: bool,
+    mouse_scroll_lines: usize,
+    redraw_on_focus_gained: bool,
+    host_cursor: crate::config::HostCursorModeConfig,
+    kitty_graphics_enabled: bool,
+    remote_image_paste_key: Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
 }
 
 fn fleet_visual_config(config: &crate::config::Config) -> FleetVisualConfig {
@@ -122,7 +146,6 @@ fn fleet_visual_config(config: &crate::config::Config) -> FleetVisualConfig {
         sidebar_spaces: config.ui.sidebar.spaces.clone(),
         sidebar_min_width,
         sidebar_max_width,
-        sidebar_start_collapsed: config.ui.sidebar_start_collapsed,
         sidebar_collapsed_mode: config.ui.sidebar_collapsed_mode,
         confirm_close: config.ui.confirm_close,
         show_agent_labels_on_pane_borders: config.ui.show_agent_labels_on_pane_borders,
@@ -132,6 +155,11 @@ fn fleet_visual_config(config: &crate::config::Config) -> FleetVisualConfig {
         prefix_code,
         prefix_mods,
         mouse_capture: config.ui.mouse_capture,
+        mouse_scroll_lines: config.ui.mouse_scroll_lines(),
+        redraw_on_focus_gained: config.ui.redraw_on_focus_gained,
+        host_cursor: config.ui.host_cursor,
+        kitty_graphics_enabled: config.experimental.kitty_graphics,
+        remote_image_paste_key: config.remote_image_paste_key().ok().flatten(),
     }
 }
 
@@ -139,22 +167,25 @@ pub(super) fn run() -> io::Result<()> {
     super::init_logging();
     let loaded = crate::config::Config::load();
     crate::terminal_modes::clear_host_mouse_reporting(&mut io::stdout())?;
+    let config_diagnostic = crate::config::config_diagnostic_summary(&loaded.diagnostics);
+    let mut sidebar = crate::app::client_shell_state_from_config(&loaded.config, config_diagnostic);
     let visual = fleet_visual_config(&loaded.config);
     let mouse_capture = visual.mouse_capture;
-    let sidebar_width = visual.sidebar_width;
-    let (cols, rows, _, _) = super::initial_terminal_geometry(false);
-    let initial_sidebar_width = if visual.sidebar_start_collapsed {
-        match visual.sidebar_collapsed_mode {
-            crate::config::SidebarCollapsedModeConfig::Compact => 4,
-            crate::config::SidebarCollapsedModeConfig::Hidden => 0,
-        }
-    } else {
-        sidebar_width
-    }
-    .min(cols.saturating_sub(2));
-    let content_cols = cols.saturating_sub(initial_sidebar_width).max(2);
     let registry = crate::fleet::load();
-
+    if let Some(width) = registry.presentation().sidebar_width {
+        sidebar.sidebar_width = width.clamp(sidebar.sidebar_min_width, sidebar.sidebar_max_width);
+        sidebar.sidebar_width_source = crate::app::state::SidebarWidthSource::Persisted;
+    }
+    if let Some(split) = registry.presentation().sidebar_section_split {
+        sidebar.sidebar_section_split = split;
+    }
+    sidebar.collapsed_space_keys = registry.presentation().collapsed_space_keys.clone();
+    let (cols, rows, cell_width_px, cell_height_px) =
+        super::initial_terminal_geometry(visual.kitty_graphics_enabled);
+    crate::ui::compute_client_shell_view(&mut sidebar, Rect::new(0, 0, cols, rows));
+    let content = sidebar.view.terminal_area;
+    let content_cols = content.width.max(2);
+    let content_rows = content.height.max(1);
     let mut bridges = Vec::new();
     let mut instances = Vec::new();
     instances.push(Instance {
@@ -165,6 +196,12 @@ pub(super) fn run() -> io::Result<()> {
         snapshot: None,
         frame: None,
         error: None,
+        mouse_capture,
+        keyboard_report_all: false,
+        prefix_input_active: false,
+        window_title: None,
+        request_tx: None,
+        client_socket: None,
     });
 
     for definition in registry.enabled_instances() {
@@ -176,6 +213,12 @@ pub(super) fn run() -> io::Result<()> {
             snapshot: None,
             frame: None,
             error: None,
+            mouse_capture,
+            keyboard_report_all: false,
+            prefix_input_active: false,
+            window_title: None,
+            request_tx: None,
+            client_socket: None,
         };
         match crate::remote::start_fleet_remote_bridge(
             &definition.target,
@@ -186,7 +229,15 @@ pub(super) fn run() -> io::Result<()> {
                 let client_socket = bridge.client_socket().to_path_buf();
                 let api_socket = bridge.api_socket().to_path_buf();
                 instance.api_target = Some(ConnectionTarget::SocketPath(api_socket));
-                instance.writer = connect_app(&client_socket, content_cols, rows).ok();
+                instance.client_socket = Some(client_socket.clone());
+                instance.writer = connect_app(
+                    &client_socket,
+                    content_cols,
+                    content_rows,
+                    cell_width_px,
+                    cell_height_px,
+                )
+                .ok();
                 if instance.writer.is_none() {
                     instance.error = Some("app connection failed".to_string());
                 }
@@ -198,7 +249,14 @@ pub(super) fn run() -> io::Result<()> {
     }
 
     let local_socket = crate::server::socket_paths::client_socket_path();
-    match connect_app(&local_socket, content_cols, rows) {
+    instances[0].client_socket = Some(local_socket.clone());
+    match connect_app(
+        &local_socket,
+        content_cols,
+        content_rows,
+        cell_width_px,
+        cell_height_px,
+    ) {
         Ok(stream) => instances[0].writer = Some(stream),
         Err(err) => return Err(io::Error::other(err.to_string())),
     }
@@ -216,10 +274,11 @@ pub(super) fn run() -> io::Result<()> {
         instances,
         cols,
         rows,
-        sidebar_width,
+        cell_width_px,
+        cell_height_px,
+        sidebar,
         mouse_capture,
         should_quit,
-        visual.sound.clone(),
         visual,
     ));
 
@@ -230,25 +289,25 @@ pub(super) fn run() -> io::Result<()> {
     result.map_err(|err| io::Error::other(err.to_string()))
 }
 
-fn connect_app(path: &PathBuf, cols: u16, rows: u16) -> Result<LocalStream, ClientError> {
+fn connect_app(
+    path: &PathBuf,
+    cols: u16,
+    rows: u16,
+    cell_width_px: u32,
+    cell_height_px: u32,
+) -> Result<LocalStream, ClientError> {
     let mut stream =
         crate::ipc::connect_local_stream(path).map_err(ClientError::ConnectionFailed)?;
     super::do_handshake(
         &mut stream,
         cols,
         rows,
-        0,
-        0,
+        cell_width_px,
+        cell_height_px,
         RenderEncoding::SemanticFrame,
         false,
+        AppSurface::Content,
     )?;
-    super::write_to_server(
-        &mut stream,
-        &ClientMessage::SetAppSurface {
-            surface: AppSurface::Content,
-        },
-    )
-    .map_err(ClientError::ConnectionFailed)?;
     Ok(stream)
 }
 
@@ -256,40 +315,59 @@ async fn run_loop(
     instances: Vec<Instance>,
     cols: u16,
     rows: u16,
-    sidebar_width: u16,
+    initial_cell_width_px: u32,
+    initial_cell_height_px: u32,
+    sidebar: crate::app::AppState,
     mouse_capture: bool,
     should_quit: Arc<AtomicBool>,
-    sound_config: crate::config::SoundConfig,
     visual: FleetVisualConfig,
 ) -> Result<(), ClientError> {
     let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(256);
     let (fleet_tx, mut fleet_rx) = tokio::sync::mpsc::channel::<FleetEvent>(256);
     let host_mouse_capture = Arc::new(AtomicBool::new(mouse_capture));
 
+    let will_query_host_terminal_theme = super::should_query_host_terminal_theme();
+    let will_query_host_cell_size =
+        super::host_cell_size_query_required(visual.kitty_graphics_enabled);
     let stdin_quit = should_quit.clone();
     let stdin_capture = host_mouse_capture.clone();
     let stdin_tx = input_tx.clone();
     std::thread::spawn(move || {
-        super::input::stdin_reader_loop(stdin_tx, &stdin_quit, false, false, stdin_capture);
+        super::input::stdin_reader_loop(
+            stdin_tx,
+            &stdin_quit,
+            will_query_host_terminal_theme,
+            will_query_host_cell_size,
+            stdin_capture,
+        );
     });
+    if will_query_host_terminal_theme {
+        super::query_host_terminal_theme();
+    }
+    if will_query_host_cell_size {
+        super::query_host_cell_size();
+    }
 
     let resize_quit = should_quit.clone();
     let resize_tx = input_tx.clone();
-    let reported_cell_size = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let reported_cell_size = Arc::new(AtomicU64::new(0));
+    let resize_cell_size = reported_cell_size.clone();
+    let kitty_graphics_enabled = visual.kitty_graphics_enabled;
     std::thread::spawn(move || {
         super::resize_poll_loop(
             resize_tx,
             cols,
             rows,
-            0,
-            0,
-            false,
-            &reported_cell_size,
+            initial_cell_width_px,
+            initial_cell_height_px,
+            kitty_graphics_enabled,
+            &resize_cell_size,
             &resize_quit,
         );
     });
 
-    for instance in &instances {
+    let mut instances = instances;
+    for instance in &mut instances {
         if let Some(writer) = &instance.writer {
             let read_stream = writer.try_clone().map_err(ClientError::ConnectionFailed)?;
             spawn_server_reader(
@@ -297,10 +375,12 @@ async fn run_loop(
                 read_stream,
                 fleet_tx.clone(),
                 should_quit.clone(),
+                visual.kitty_graphics_enabled,
             );
         }
         if let Some(target) = instance.api_target.clone() {
-            spawn_snapshot_poller(
+            instance.request_tx = Some(spawn_api_worker(target.clone(), should_quit.clone()));
+            spawn_snapshot_watcher(
                 instance.id.clone(),
                 target,
                 fleet_tx.clone(),
@@ -309,8 +389,21 @@ async fn run_loop(
         }
     }
 
-    let mut sidebar = crate::app::AppState::empty_for_client_rendering();
-    configure_sidebar_state(&mut sidebar, &visual, sidebar_width, cols, rows);
+    let host = super::ClientState {
+        blit_encoder: crate::protocol::render_ansi::BlitEncoder::new(),
+        mouse_capture_active: mouse_capture,
+        keyboard_report_all_active: false,
+        reported_size: (cols, rows),
+        sound_config: visual.sound.clone(),
+        kitty_graphics_enabled: visual.kitty_graphics_enabled,
+        attach_escape: None,
+        #[cfg(unix)]
+        mouse_scroll_lines: visual.mouse_scroll_lines,
+        remote_image_paste_key: visual.remote_image_paste_key,
+        redraw_on_focus_gained: visual.redraw_on_focus_gained,
+        repaint_pending: true,
+        draw_host_cursor: super::should_draw_host_cursor(visual.host_cursor),
+    };
     let mut state = FleetState {
         instances,
         active: 0,
@@ -318,10 +411,17 @@ async fn run_loop(
         workspace_routes: HashMap::new(),
         tab_routes: HashMap::new(),
         pane_routes: HashMap::new(),
-        blit_encoder: crate::protocol::render_ansi::BlitEncoder::new(),
-        repaint_pending: true,
+        projected_terminal_ids: HashMap::new(),
+        projected_pane_ids: HashMap::new(),
         quit_requested: false,
-        sound_config,
+        host,
+        host_mouse_capture,
+        prefix_input_source: crate::platform::RealPrefixInputSource::default(),
+        pending_prefix_bytes: Vec::new(),
+        cell_width_px: initial_cell_width_px,
+        cell_height_px: initial_cell_height_px,
+        last_reconnect_attempt: Instant::now(),
+        working_animation_frame: 0,
         visual,
     };
     let mut current_cols = cols;
@@ -348,7 +448,27 @@ async fn run_loop(
                     render(&mut state, current_cols, current_rows);
                 }
             }
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                reconnect_content_streams(
+                    &mut state,
+                    current_cols,
+                    current_rows,
+                    &fleet_tx,
+                    &should_quit,
+                );
+                if state
+                    .sidebar
+                    .terminals
+                    .values()
+                    .any(|terminal| terminal.state == crate::detect::AgentState::Working)
+                {
+                    state.working_animation_frame = (state.working_animation_frame + 1) % 4;
+                    crate::ui::set_working_animation_frame(Some(state.working_animation_frame));
+                    render(&mut state, current_cols, current_rows);
+                } else {
+                    crate::ui::set_working_animation_frame(None);
+                }
+            }
         }
     }
 
@@ -357,7 +477,77 @@ async fn run_loop(
             let _ = super::write_to_server(writer, &ClientMessage::Detach);
         }
     }
+    crate::ui::set_working_animation_frame(None);
     Ok(())
+}
+
+fn reconnect_content_streams(
+    state: &mut FleetState,
+    cols: u16,
+    rows: u16,
+    event_tx: &tokio::sync::mpsc::Sender<FleetEvent>,
+    should_quit: &Arc<AtomicBool>,
+) {
+    if state.last_reconnect_attempt.elapsed() < RECONNECT_INTERVAL {
+        return;
+    }
+    state.last_reconnect_attempt = Instant::now();
+    update_sidebar_geometry(state, cols, rows);
+    let content = state.sidebar.view.terminal_area;
+    for instance in &mut state.instances {
+        if instance.writer.is_some() {
+            continue;
+        }
+        let Some(socket) = instance.client_socket.clone() else {
+            continue;
+        };
+        match connect_app(
+            &socket,
+            content.width.max(2),
+            content.height.max(1),
+            state.cell_width_px,
+            state.cell_height_px,
+        ) {
+            Ok(writer) => {
+                let Ok(reader) = writer.try_clone() else {
+                    continue;
+                };
+                spawn_server_reader(
+                    instance.id.clone(),
+                    reader,
+                    event_tx.clone(),
+                    should_quit.clone(),
+                    state.host.kitty_graphics_enabled,
+                );
+                instance.writer = Some(writer);
+                instance.error = None;
+                state.host.request_repaint();
+            }
+            Err(err) => instance.error = Some(err.to_string()),
+        }
+    }
+}
+
+fn spawn_api_worker(
+    target: ConnectionTarget,
+    should_quit: Arc<AtomicBool>,
+) -> std::sync::mpsc::Sender<ApiCommand> {
+    let (tx, rx) = std::sync::mpsc::channel::<ApiCommand>();
+    std::thread::spawn(move || {
+        let client = ApiClient::for_target(target);
+        while !should_quit.load(Ordering::Acquire) {
+            let Ok(command) = rx.recv_timeout(Duration::from_millis(100)) else {
+                continue;
+            };
+            if let Err(err) = client.request(Request {
+                id: command.id.to_string(),
+                method: command.method,
+            }) {
+                tracing::warn!(id = command.id, err = %err, "fleet API command failed");
+            }
+        }
+    });
+    tx
 }
 
 fn spawn_server_reader(
@@ -365,11 +555,17 @@ fn spawn_server_reader(
     mut stream: LocalStream,
     event_tx: tokio::sync::mpsc::Sender<FleetEvent>,
     should_quit: Arc<AtomicBool>,
+    kitty_graphics_enabled: bool,
 ) {
     std::thread::spawn(move || {
         let _ = stream.set_nonblocking(false);
         while !should_quit.load(Ordering::Acquire) {
-            match protocol::read_message(&mut stream, MAX_FRAME_SIZE) {
+            let max_frame_size = if kitty_graphics_enabled {
+                MAX_GRAPHICS_FRAME_SIZE
+            } else {
+                MAX_FRAME_SIZE
+            };
+            match protocol::read_message(&mut stream, max_frame_size) {
                 Ok(message) => {
                     if event_tx
                         .blocking_send(FleetEvent::ServerMessage {
@@ -390,39 +586,147 @@ fn spawn_server_reader(
     });
 }
 
-fn spawn_snapshot_poller(
+fn spawn_snapshot_watcher(
     instance_id: String,
     target: ConnectionTarget,
     event_tx: tokio::sync::mpsc::Sender<FleetEvent>,
     should_quit: Arc<AtomicBool>,
 ) {
     std::thread::spawn(move || {
-        let client = ApiClient::for_target(target);
         while !should_quit.load(Ordering::Acquire) {
-            let result = client
-                .request(Request {
-                    id: format!("fleet-snapshot:{instance_id}"),
-                    method: Method::SessionSnapshot(EmptyParams::default()),
-                })
-                .and_then(|response| match response.result {
-                    ResponseResult::SessionSnapshot { snapshot } => Ok(*snapshot),
-                    result => Err(crate::api::client::ApiClientError::UnexpectedResult(
-                        format!("{result:?}"),
-                    )),
-                })
-                .map_err(|err| err.to_string());
-            if event_tx
-                .blocking_send(FleetEvent::Snapshot {
-                    instance_id: instance_id.clone(),
-                    result,
-                })
-                .is_err()
-            {
+            let client = ApiClient::for_target(target.clone());
+            let pane_ids = match send_snapshot(&instance_id, &client, &event_tx) {
+                Ok(pane_ids) => pane_ids,
+                Err(()) => return,
+            };
+            let result =
+                watch_instance_events(&instance_id, &client, &event_tx, &should_quit, &pane_ids);
+            if should_quit.load(Ordering::Acquire) {
                 return;
             }
-            std::thread::sleep(SNAPSHOT_INTERVAL);
+            match result {
+                Ok(true) => continue,
+                Ok(false) => return,
+                Err(error) => {
+                    let _ = event_tx.blocking_send(FleetEvent::Snapshot {
+                        instance_id: instance_id.clone(),
+                        result: Err(error),
+                    });
+                }
+            }
+            std::thread::sleep(RECONNECT_INTERVAL);
         }
     });
+}
+
+fn send_snapshot(
+    instance_id: &str,
+    client: &ApiClient,
+    event_tx: &tokio::sync::mpsc::Sender<FleetEvent>,
+) -> Result<Vec<String>, ()> {
+    let result = client
+        .request(Request {
+            id: format!("fleet-snapshot:{instance_id}"),
+            method: Method::SessionSnapshot(EmptyParams::default()),
+        })
+        .and_then(|response| match response.result {
+            ResponseResult::SessionSnapshot { snapshot } => Ok(*snapshot),
+            result => Err(crate::api::client::ApiClientError::UnexpectedResult(
+                format!("{result:?}"),
+            )),
+        })
+        .map_err(|err| err.to_string());
+    let mut pane_ids: Vec<String> = result
+        .as_ref()
+        .map(|snapshot| {
+            snapshot
+                .panes
+                .iter()
+                .map(|pane| pane.pane_id.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    pane_ids.sort();
+    event_tx
+        .blocking_send(FleetEvent::Snapshot {
+            instance_id: instance_id.to_string(),
+            result,
+        })
+        .map_err(|_| ())?;
+    Ok(pane_ids)
+}
+
+fn watch_instance_events(
+    instance_id: &str,
+    client: &ApiClient,
+    event_tx: &tokio::sync::mpsc::Sender<FleetEvent>,
+    should_quit: &AtomicBool,
+    pane_ids: &[String],
+) -> Result<bool, String> {
+    use crate::api::schema::{EventsSubscribeParams, Subscription};
+
+    let mut stream =
+        crate::ipc::connect_local_stream(&client.socket_path()).map_err(|err| err.to_string())?;
+    let mut subscriptions = vec![
+        Subscription::WorkspaceCreated {},
+        Subscription::WorkspaceUpdated {},
+        Subscription::WorkspaceMetadataUpdated {},
+        Subscription::WorkspaceRenamed {},
+        Subscription::WorkspaceMoved {},
+        Subscription::WorkspaceReordered {},
+        Subscription::WorkspaceClosed {},
+        Subscription::WorkspaceFocused {},
+        Subscription::WorktreeCreated {},
+        Subscription::WorktreeOpened {},
+        Subscription::WorktreeRemoved {},
+        Subscription::TabCreated {},
+        Subscription::TabClosed {},
+        Subscription::TabFocused {},
+        Subscription::TabRenamed {},
+        Subscription::TabMoved {},
+        Subscription::PaneCreated {},
+        Subscription::PaneClosed {},
+        Subscription::PaneUpdated {},
+        Subscription::PaneFocused {},
+        Subscription::PaneMoved {},
+        Subscription::PaneExited {},
+        Subscription::PaneAgentDetected {},
+        Subscription::LayoutUpdated {},
+    ];
+    subscriptions.extend(pane_ids.iter().cloned().map(|pane_id| {
+        Subscription::PaneAgentStatusChanged {
+            pane_id,
+            agent_status: None,
+        }
+    }));
+    let request = Request {
+        id: format!("fleet-events:{instance_id}"),
+        method: Method::EventsSubscribe(EventsSubscribeParams { subscriptions }),
+    };
+    let encoded = serde_json::to_vec(&request).map_err(|err| err.to_string())?;
+    stream.write_all(&encoded).map_err(|err| err.to_string())?;
+    stream.write_all(b"\n").map_err(|err| err.to_string())?;
+    stream.flush().map_err(|err| err.to_string())?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    while !should_quit.load(Ordering::Acquire) {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => return Err("event stream disconnected".to_string()),
+            Ok(_) => {
+                let updated_pane_ids = match send_snapshot(instance_id, client, event_tx) {
+                    Ok(pane_ids) => pane_ids,
+                    Err(()) => return Ok(false),
+                };
+                if updated_pane_ids != pane_ids {
+                    return Ok(true);
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err.to_string()),
+        }
+    }
+    Ok(false)
 }
 
 fn handle_fleet_event(state: &mut FleetState, event: FleetEvent) -> bool {
@@ -445,12 +749,16 @@ fn handle_fleet_event(state: &mut FleetState, event: FleetEvent) -> bool {
                 state.instances[index].frame = Some(frame);
                 false
             }
+            ServerMessage::Terminal(_) | ServerMessage::Graphics { .. } => {
+                tracing::debug!(instance = %state.instances[index].id, "ignored non-semantic fleet frame");
+                false
+            }
             ServerMessage::Notify {
                 kind,
                 message,
                 body,
             } => {
-                super::handle_notify(kind, &message, body.as_deref(), &state.sound_config);
+                super::handle_notify(kind, &message, body.as_deref(), &state.host.sound_config);
                 false
             }
             ServerMessage::Clipboard { data } if index == state.active => {
@@ -458,7 +766,43 @@ fn handle_fleet_event(state: &mut FleetState, event: FleetEvent) -> bool {
                 false
             }
             ServerMessage::WindowTitle { title } if index == state.active => {
+                state.instances[index].window_title = title.clone();
                 super::write_window_title(title.as_deref());
+                false
+            }
+            ServerMessage::WindowTitle { title } => {
+                state.instances[index].window_title = title;
+                false
+            }
+            ServerMessage::ReloadSoundConfig => {
+                super::reload_local_client_config(
+                    &mut state.host.sound_config,
+                    &mut state.host.redraw_on_focus_gained,
+                    &mut state.host.draw_host_cursor,
+                    &mut state.host.remote_image_paste_key,
+                );
+                reload_fleet_visual_config(state);
+                true
+            }
+            ServerMessage::MouseCapture { enabled } => {
+                state.instances[index].mouse_capture = enabled;
+                if index == state.active {
+                    let _ = apply_active_host_modes(state);
+                }
+                false
+            }
+            ServerMessage::KittyKeyboardReportAll { enabled } => {
+                state.instances[index].keyboard_report_all = enabled;
+                if index == state.active {
+                    let _ = apply_active_host_modes(state);
+                }
+                false
+            }
+            ServerMessage::PrefixInputSource { active } => {
+                state.instances[index].prefix_input_active = active;
+                if index == state.active {
+                    apply_active_prefix_input_source(state);
+                }
                 false
             }
             ServerMessage::ServerShutdown { reason } => {
@@ -492,6 +836,35 @@ fn handle_fleet_event(state: &mut FleetState, event: FleetEvent) -> bool {
     }
 }
 
+fn apply_active_host_modes(state: &mut FleetState) -> Result<(), ClientError> {
+    let desired_mouse = state.instances[state.active].mouse_capture;
+    if desired_mouse != state.host.mouse_capture_active {
+        super::set_mouse_capture(desired_mouse).map_err(ClientError::ConnectionFailed)?;
+        state.host.mouse_capture_active = desired_mouse;
+        state
+            .host_mouse_capture
+            .store(desired_mouse, Ordering::Release);
+    }
+    let desired_keyboard = state.instances[state.active].keyboard_report_all;
+    if desired_keyboard != state.host.keyboard_report_all_active {
+        crate::terminal_modes::set_host_kitty_keyboard_report_all(
+            &mut io::stdout(),
+            desired_keyboard,
+        )
+        .map_err(ClientError::ConnectionFailed)?;
+        state.host.keyboard_report_all_active = desired_keyboard;
+    }
+    Ok(())
+}
+
+fn apply_active_prefix_input_source(state: &mut FleetState) {
+    if state.instances[state.active].prefix_input_active {
+        state.prefix_input_source.switch_to_ascii();
+    } else {
+        state.prefix_input_source.restore();
+    }
+}
+
 fn handle_input(
     state: &mut FleetState,
     input: ClientLoopEvent,
@@ -502,10 +875,13 @@ fn handle_input(
         ClientLoopEvent::StdinInput(data) => {
             route_raw_input(state, data, current_cols, current_rows)
         }
-        ClientLoopEvent::Resize(cols, rows, _, _) => {
+        ClientLoopEvent::Resize(cols, rows, cell_width_px, cell_height_px) => {
+            state.host.reported_size = (cols, rows);
+            state.cell_width_px = cell_width_px;
+            state.cell_height_px = cell_height_px;
             update_sidebar_geometry(state, cols, rows);
             resize_content_streams(state, cols, rows)?;
-            state.repaint_pending = true;
+            state.host.request_repaint();
             render(state, cols, rows);
             Ok(())
         }
@@ -519,6 +895,40 @@ fn route_raw_input(
     current_cols: u16,
     current_rows: u16,
 ) -> Result<(), ClientError> {
+    let parsed = crate::raw_input::parse_raw_input_bytes_sync(&data);
+    if crate::raw_input::events_require_host_surface_redraw(
+        &parsed,
+        state.host.redraw_on_focus_gained,
+    ) {
+        state.host.request_repaint();
+    }
+    if crate::raw_input::events_require_host_terminal_theme_query(&parsed) {
+        super::query_host_terminal_theme();
+    }
+    if let Some((width_px, height_px)) = super::reported_cell_size_from_events(&parsed) {
+        state.cell_width_px = width_px;
+        state.cell_height_px = height_px;
+    }
+    let active_is_remote = state.active != 0;
+    if super::should_bridge_clipboard_image_paste(
+        &data,
+        active_is_remote,
+        state.host.remote_image_paste_key,
+    ) {
+        if let Some(image) = crate::platform::read_clipboard_image() {
+            if let Some(writer) = state.instances[state.active].writer.as_mut() {
+                super::write_remote_image_to_server(writer, image, "clipboard paste")?;
+            }
+            return Ok(());
+        }
+    }
+    if let Some(image) = super::read_image_file_from_terminal_drop(&data, active_is_remote) {
+        if let Some(writer) = state.instances[state.active].writer.as_mut() {
+            super::write_remote_image_to_server(writer, image, "file drop")?;
+        }
+        return Ok(());
+    }
+
     let events = crate::raw_input::parse_raw_input_bytes_with_ranges(&data);
     if events.is_empty() {
         return write_active(state, ClientMessage::Input { data });
@@ -544,8 +954,23 @@ fn route_raw_input(
                     == MouseInputRoute::Sidebar;
             }
             crate::raw_input::RawInputEvent::Key(key) => {
+                let previous_mode = state.sidebar.mode;
                 match crate::app::handle_client_sidebar_key(&mut state.sidebar, key) {
-                    crate::app::ClientSidebarInput::Forward => forward.extend_from_slice(raw),
+                    crate::app::ClientSidebarInput::Forward => {
+                        if previous_mode == crate::app::Mode::Terminal
+                            && state.sidebar.mode == crate::app::Mode::Prefix
+                        {
+                            state.pending_prefix_bytes = raw.to_vec();
+                        }
+                        forward.extend_from_slice(raw);
+                    }
+                    crate::app::ClientSidebarInput::ForwardWithPrefix => {
+                        flush_active_input(state, &mut forward)?;
+                        let mut replay = state.pending_prefix_bytes.clone();
+                        replay.extend_from_slice(raw);
+                        write_active(state, ClientMessage::Input { data: replay })?;
+                        shell_changed = true;
+                    }
                     crate::app::ClientSidebarInput::CancelServerPrefix(action) => {
                         flush_active_input(state, &mut forward)?;
                         cancel_active_server_prefix(state)?;
@@ -576,6 +1001,30 @@ fn route_raw_input(
                     forward.extend_from_slice(raw);
                 }
             }
+            crate::raw_input::RawInputEvent::HostDefaultColor { kind, color } => {
+                flush_active_input(state, &mut forward)?;
+                shell_changed |= state.sidebar.update_host_terminal_theme_state(kind, color);
+                broadcast_input(state, raw)?;
+            }
+            crate::raw_input::RawInputEvent::HostPaletteColors { colors } => {
+                flush_active_input(state, &mut forward)?;
+                shell_changed |= state.sidebar.update_host_terminal_palette_state(&colors);
+                broadcast_input(state, raw)?;
+            }
+            crate::raw_input::RawInputEvent::HostColorSchemeChanged(appearance) => {
+                flush_active_input(state, &mut forward)?;
+                shell_changed |= state
+                    .sidebar
+                    .set_host_terminal_appearance_for_presentation(Some(appearance), true);
+                broadcast_input(state, raw)?;
+            }
+            crate::raw_input::RawInputEvent::HostCellSizeReport {
+                width_px,
+                height_px,
+            } => {
+                state.cell_width_px = width_px;
+                state.cell_height_px = height_px;
+            }
             _ => forward.extend_from_slice(raw),
         }
     }
@@ -590,8 +1039,42 @@ fn route_raw_input(
         if current_sidebar_width(state, current_cols) != previous_width {
             resize_content_streams(state, current_cols, current_rows)?;
         }
-        state.repaint_pending = true;
+        state.host.request_repaint();
+        persist_fleet_presentation(state);
         render(state, current_cols, current_rows);
+    }
+    Ok(())
+}
+
+fn persist_fleet_presentation(state: &mut FleetState) {
+    state.sidebar.session_dirty = false;
+    let presentation = crate::fleet::FleetPresentation {
+        sidebar_width: Some(state.sidebar.sidebar_width),
+        sidebar_section_split: Some(state.sidebar.sidebar_section_split),
+        collapsed_space_keys: state.sidebar.collapsed_space_keys.clone(),
+    };
+    if crate::fleet::load().presentation() == &presentation {
+        return;
+    }
+    if let Err(err) = crate::fleet::update(|registry| {
+        registry.set_presentation(presentation);
+        Ok(())
+    }) {
+        tracing::warn!(err = %err, "failed to persist fleet presentation");
+    }
+}
+
+fn broadcast_input(state: &mut FleetState, data: &[u8]) -> Result<(), ClientError> {
+    for instance in &mut state.instances {
+        if let Some(writer) = &mut instance.writer {
+            super::write_to_server(
+                writer,
+                &ClientMessage::Input {
+                    data: data.to_vec(),
+                },
+            )
+            .map_err(ClientError::ConnectionLost)?;
+        }
     }
     Ok(())
 }
@@ -624,13 +1107,16 @@ fn handle_mouse_input(
     current_cols: u16,
     current_rows: u16,
 ) -> Result<MouseInputRoute, ClientError> {
-    let sidebar_width = current_sidebar_width(state, current_cols);
+    update_sidebar_geometry(state, current_cols, current_rows);
+    let content_rect = state.sidebar.view.terminal_area;
+    let sidebar_width = state.sidebar.view.sidebar_rect.width;
     if state.sidebar.mode == crate::app::Mode::Prefix {
         cancel_active_server_prefix(state)?;
         state.sidebar.mode = crate::app::Mode::Terminal;
     }
     let sidebar_related = state.sidebar.mode != crate::app::Mode::Terminal
-        || mouse.column < sidebar_width
+        || mouse.column < content_rect.x
+        || mouse.row < content_rect.y
         || state.sidebar.drag.is_some();
     if sidebar_related {
         if let Some(action) = crate::app::handle_client_sidebar_mouse(&mut state.sidebar, mouse) {
@@ -646,8 +1132,8 @@ fn handle_mouse_input(
     if let Some(kind) = mouse_kind(mouse.kind) {
         let event = ClientInputEvent::Mouse {
             kind,
-            column: mouse.column.saturating_sub(sidebar_width),
-            row: mouse.row,
+            column: mouse.column.saturating_sub(content_rect.x),
+            row: mouse.row.saturating_sub(content_rect.y),
             modifiers: mouse.modifiers.bits(),
         };
         write_active(
@@ -661,9 +1147,10 @@ fn handle_mouse_input(
 }
 
 fn resize_content_streams(state: &mut FleetState, cols: u16, rows: u16) -> Result<(), ClientError> {
-    let content_cols = cols
-        .saturating_sub(current_sidebar_width(state, cols))
-        .max(2);
+    update_sidebar_geometry(state, cols, rows);
+    let content = state.sidebar.view.terminal_area;
+    let content_cols = content.width.max(2);
+    let content_rows = content.height.max(1);
     for instance in &mut state.instances {
         instance.frame = None;
         if let Some(writer) = &mut instance.writer {
@@ -671,9 +1158,9 @@ fn resize_content_streams(state: &mut FleetState, cols: u16, rows: u16) -> Resul
                 writer,
                 &ClientMessage::Resize {
                     cols: content_cols,
-                    rows,
-                    cell_width_px: 0,
-                    cell_height_px: 0,
+                    rows: content_rows,
+                    cell_width_px: state.cell_width_px,
+                    cell_height_px: state.cell_height_px,
                 },
             )
             .map_err(ClientError::ConnectionLost)?;
@@ -974,11 +1461,15 @@ fn activate_sidebar_route(state: &mut FleetState, ws_idx: usize, route: Option<S
         }
     };
     state.active = index;
+    state.host.request_repaint();
     state.sidebar.active = Some(ws_idx);
     state.sidebar.selected = ws_idx;
     if let Some(method) = method {
         request_for_instance(state, index, "fleet-focus", method);
     }
+    let _ = apply_active_host_modes(state);
+    apply_active_prefix_input_source(state);
+    super::write_window_title(state.instances[index].window_title.as_deref());
 }
 
 fn request_for_active(state: &FleetState, id: &'static str, method: Method) {
@@ -986,19 +1477,14 @@ fn request_for_active(state: &FleetState, id: &'static str, method: Method) {
 }
 
 fn request_for_instance(state: &FleetState, index: usize, id: &'static str, method: Method) {
-    let Some(target) = state
+    let Some(request_tx) = state
         .instances
         .get(index)
-        .and_then(|instance| instance.api_target.clone())
+        .and_then(|instance| instance.request_tx.as_ref())
     else {
         return;
     };
-    std::thread::spawn(move || {
-        let _ = ApiClient::for_target(target).request(Request {
-            id: id.to_string(),
-            method,
-        });
-    });
+    let _ = request_tx.send(ApiCommand { id, method });
 }
 
 fn render(state: &mut FleetState, cols: u16, rows: u16) {
@@ -1006,12 +1492,12 @@ fn render(state: &mut FleetState, cols: u16, rows: u16) {
         return;
     }
     update_sidebar_geometry(state, cols, rows);
-    let sidebar_width = current_sidebar_width(state, cols);
+    let content_rect = state.sidebar.view.terminal_area;
     let base = compose_frame(
         state.instances[state.active].frame.as_ref(),
         cols,
         rows,
-        sidebar_width,
+        content_rect,
     );
     let Some(base_buffer) = base.to_ratatui_buffer() else {
         return;
@@ -1044,52 +1530,40 @@ fn render(state: &mut FleetState, cols: u16, rows: u16) {
     }
     frame.hyperlinks = base.hyperlinks;
     frame.graphics = base.graphics;
-    let encoded = state.blit_encoder.encode(&frame, state.repaint_pending);
+    let frame = if state.host.draw_host_cursor {
+        crate::protocol::render_ansi::frame_with_drawn_cursor(frame)
+    } else {
+        frame
+    };
+    let encoded = if state.host.draw_host_cursor {
+        state
+            .host
+            .blit_encoder
+            .encode_with_suppressed_visible_cursor(&frame, state.host.repaint_pending)
+    } else {
+        state
+            .host
+            .blit_encoder
+            .encode(&frame, state.host.repaint_pending)
+    };
     let mut stdout = io::stdout();
-    let _ = stdout.write_all(&encoded.bytes);
+    let graphics = if state.host.kitty_graphics_enabled {
+        frame.graphics.as_slice()
+    } else {
+        &[]
+    };
+    let _ = super::write_encoded_frame_with_graphics(&mut stdout, &encoded.bytes, graphics);
     let _ = stdout.flush();
-    state.blit_encoder.commit(frame, encoded);
-    state.repaint_pending = false;
-}
-
-fn configure_sidebar_state(
-    app: &mut crate::app::AppState,
-    visual: &FleetVisualConfig,
-    width: u16,
-    cols: u16,
-    rows: u16,
-) {
-    app.sidebar_width = width;
-    app.default_sidebar_width = width;
-    app.sidebar_min_width = visual.sidebar_min_width;
-    app.sidebar_max_width = visual.sidebar_max_width;
-    app.sidebar_section_split = 0.5;
-    app.sidebar_collapsed = visual.sidebar_start_collapsed;
-    app.sidebar_collapsed_mode = visual.sidebar_collapsed_mode;
-    app.status_indicators = visual.status_indicators;
-    app.agent_panel_sort = visual.agent_panel_sort;
-    app.sidebar_agents = visual.sidebar_agents.clone();
-    app.sidebar_spaces = visual.sidebar_spaces.clone();
-    app.mouse_capture = visual.mouse_capture;
-    app.confirm_close = visual.confirm_close;
-    app.show_agent_labels_on_pane_borders = visual.show_agent_labels_on_pane_borders;
-    app.sound = visual.sound.clone();
-    app.toast_config = visual.toast.clone();
-    app.keybinds = visual.keybinds.clone();
-    app.prefix_code = visual.prefix_code;
-    app.prefix_mods = visual.prefix_mods;
-    app.palette = visual.palette.clone();
-    app.theme_name = visual.theme_name.clone();
-    app.theme_runtime = visual.theme_runtime.clone();
-    app.mode = crate::app::Mode::Terminal;
-    app.view.layout = crate::app::state::ViewLayout::Desktop;
-    let sidebar_width = current_app_sidebar_width(app, cols);
-    app.view.sidebar_rect = Rect::new(0, 0, sidebar_width, rows);
-    app.view.terminal_area = Rect::new(sidebar_width, 0, cols.saturating_sub(sidebar_width), rows);
+    state.host.blit_encoder.commit(frame, encoded);
+    state.host.repaint_pending = false;
 }
 
 fn apply_fleet_visual_config(state: &mut FleetState, visual: FleetVisualConfig) {
-    state.sound_config = visual.sound.clone();
+    state.host.sound_config = visual.sound.clone();
+    state.host.mouse_scroll_lines = visual.mouse_scroll_lines;
+    state.host.redraw_on_focus_gained = visual.redraw_on_focus_gained;
+    state.host.remote_image_paste_key = visual.remote_image_paste_key;
+    state.host.draw_host_cursor = super::should_draw_host_cursor(visual.host_cursor);
     let app = &mut state.sidebar;
     app.default_sidebar_width = visual.sidebar_width;
     app.sidebar_min_width = visual.sidebar_min_width;
@@ -1123,8 +1597,7 @@ fn reload_fleet_visual_config(state: &mut FleetState) {
 }
 
 fn sync_sidebar_model(state: &mut FleetState, cols: u16, rows: u16) {
-    let (mut model, workspace_routes, tab_routes, pane_routes) =
-        build_sidebar_state(state, cols, rows);
+    let (mut model, workspace_routes, tab_routes, pane_routes) = build_sidebar_state(state);
     state.sidebar.terminals = std::mem::take(&mut model.terminals);
     state.sidebar.workspaces = std::mem::take(&mut model.workspaces);
     state.sidebar.active = model.active;
@@ -1143,59 +1616,21 @@ fn sync_sidebar_model(state: &mut FleetState, cols: u16, rows: u16) {
     update_sidebar_geometry(state, cols, rows);
 }
 
-fn current_app_sidebar_width(app: &crate::app::AppState, cols: u16) -> u16 {
-    let desired = if app.sidebar_collapsed {
-        match app.sidebar_collapsed_mode {
-            crate::config::SidebarCollapsedModeConfig::Compact => 4,
-            crate::config::SidebarCollapsedModeConfig::Hidden => 0,
-        }
-    } else {
-        app.sidebar_width
-            .clamp(app.sidebar_min_width, app.sidebar_max_width)
-    };
-    desired.min(cols.saturating_sub(2))
-}
-
 fn current_sidebar_width(state: &FleetState, cols: u16) -> u16 {
-    current_app_sidebar_width(&state.sidebar, cols)
+    state
+        .sidebar
+        .view
+        .sidebar_rect
+        .width
+        .min(cols.saturating_sub(2))
 }
 
 fn update_sidebar_geometry(state: &mut FleetState, cols: u16, rows: u16) {
-    let width = current_sidebar_width(state, cols);
-    state.sidebar.view.layout = crate::app::state::ViewLayout::Desktop;
-    state.sidebar.view.sidebar_rect = Rect::new(0, 0, width, rows);
-    state.sidebar.view.terminal_area = Rect::new(width, 0, cols.saturating_sub(width), rows);
-    if state.sidebar.sidebar_collapsed {
-        state.sidebar.workspace_scroll = state
-            .sidebar
-            .workspace_scroll
-            .min(state.sidebar.workspaces.len().saturating_sub(1));
-        state.sidebar.agent_panel_scroll = 0;
-        state.sidebar.view.workspace_card_areas.clear();
-    } else {
-        state.sidebar.workspace_scroll = crate::ui::normalized_workspace_scroll(
-            &state.sidebar,
-            state.sidebar.view.sidebar_rect,
-            state.sidebar.workspace_scroll,
-        );
-        let (_, detail_area) = crate::ui::expanded_sidebar_sections(
-            state.sidebar.view.sidebar_rect,
-            state.sidebar.sidebar_section_split,
-        );
-        let max_agent_scroll = crate::ui::agent_panel_scroll_metrics(&state.sidebar, detail_area)
-            .max_offset_from_bottom;
-        state.sidebar.agent_panel_scroll = state.sidebar.agent_panel_scroll.min(max_agent_scroll);
-        state.sidebar.view.workspace_card_areas = crate::ui::compute_workspace_card_areas(
-            &state.sidebar,
-            state.sidebar.view.sidebar_rect,
-        );
-    }
+    crate::ui::compute_client_shell_view(&mut state.sidebar, Rect::new(0, 0, cols, rows));
 }
 
 fn build_sidebar_state(
-    state: &FleetState,
-    cols: u16,
-    rows: u16,
+    state: &mut FleetState,
 ) -> (
     crate::app::AppState,
     HashMap<usize, SidebarHit>,
@@ -1203,12 +1638,12 @@ fn build_sidebar_state(
     HashMap<(usize, crate::layout::PaneId), SidebarHit>,
 ) {
     let mut app = crate::app::AppState::empty_for_client_rendering();
-    configure_sidebar_state(
-        &mut app,
-        &state.visual,
-        state.sidebar.sidebar_width,
-        cols,
-        rows,
+
+    let active_instance = state.active;
+    let (instances, projected_terminal_ids, projected_pane_ids) = (
+        &state.instances,
+        &mut state.projected_terminal_ids,
+        &mut state.projected_pane_ids,
     );
 
     let mut workspace_routes = HashMap::new();
@@ -1216,7 +1651,7 @@ fn build_sidebar_state(
     let mut pane_routes = HashMap::new();
     let mut active_workspace = None;
 
-    for (instance_idx, instance) in state.instances.iter().enumerate() {
+    for (instance_idx, instance) in instances.iter().enumerate() {
         let snapshot_workspaces = instance
             .snapshot
             .as_ref()
@@ -1231,13 +1666,26 @@ fn build_sidebar_state(
             } else {
                 "connecting"
             };
-            let terminal_id = crate::terminal::TerminalId::alloc();
-            let (workspace, _) = crate::workspace::Workspace::sidebar_placeholder(
+            let projection_key = format!("{}\0empty", instance.id);
+            let terminal_id = projected_terminal_ids
+                .entry(projection_key.clone())
+                .or_insert_with(crate::terminal::TerminalId::alloc)
+                .clone();
+            let pane_id = *projected_pane_ids
+                .entry(projection_key)
+                .or_insert_with(crate::layout::PaneId::alloc);
+            let (workspace, _) = crate::workspace::Workspace::sidebar_placeholder_with_tabs(
                 format!("fleet:{}:empty", instance.id),
                 format!("{} · {status}", instance.name),
                 None,
-                vec![(terminal_id.clone(), true)],
-                None,
+                vec![crate::workspace::SidebarPlaceholderTab {
+                    label: None,
+                    number: 1,
+                    pane_terminals: vec![(terminal_id.clone(), true)],
+                    pane_ids: vec![pane_id],
+                    focused_pane_idx: Some(0),
+                }],
+                0,
             );
             let ws_idx = app.workspaces.len();
             app.terminals.insert(
@@ -1251,7 +1699,7 @@ fn build_sidebar_state(
                     index: instance_idx,
                 },
             );
-            if instance_idx == state.active && active_workspace.is_none() {
+            if instance_idx == active_instance && active_workspace.is_none() {
                 active_workspace = Some(ws_idx);
             }
             continue;
@@ -1282,12 +1730,26 @@ fn build_sidebar_state(
                     .filter(|pane| pane.tab_id == tab.tab_id)
                     .collect::<Vec<_>>();
                 let mut pane_terminals = Vec::new();
+                let mut tab_projected_pane_ids = Vec::new();
                 let mut tab_remote_pane_ids = Vec::new();
                 let mut focused_pane_idx = None;
 
                 for pane in snapshot_panes {
-                    let terminal_id = crate::terminal::TerminalId::alloc();
-                    let (pane_state, seen) = native_agent_state(pane.agent_status);
+                    let projection_key = format!("{}\0{}", instance.id, pane.pane_id);
+                    let terminal_id = projected_terminal_ids
+                        .entry(projection_key.clone())
+                        .or_insert_with(crate::terminal::TerminalId::alloc)
+                        .clone();
+                    let projected_pane_id = *projected_pane_ids
+                        .entry(projection_key)
+                        .or_insert_with(crate::layout::PaneId::alloc);
+                    let agent = snapshot
+                        .agents
+                        .iter()
+                        .find(|agent| agent.pane_id == pane.pane_id);
+                    let (pane_state, seen) = native_agent_state(
+                        agent.map_or(pane.agent_status, |agent| agent.agent_status),
+                    );
                     let mut terminal = crate::terminal::TerminalState::new(
                         terminal_id.clone(),
                         pane.foreground_cwd
@@ -1296,33 +1758,49 @@ fn build_sidebar_state(
                             .unwrap_or("/")
                             .into(),
                     );
-                    terminal.state = pane_state;
-                    terminal.detected_agent = pane
+                    let detected_agent = pane
                         .agent
                         .as_deref()
                         .or(pane.display_agent.as_deref())
                         .and_then(crate::detect::parse_agent_label);
-                    if let Some(agent) = snapshot
-                        .agents
-                        .iter()
-                        .find(|agent| agent.pane_id == pane.pane_id)
-                    {
+                    terminal.set_detected_state_with_screen_signals_at(
+                        detected_agent,
+                        pane_state,
+                        false,
+                        false,
+                        false,
+                        false,
+                        Instant::now(),
+                    );
+                    if let Some(agent) = agent {
                         terminal.last_agent_state_change_seq = Some(agent.state_change_seq);
-                        terminal.set_agent_name(agent_display_name(agent));
-                    } else if let Some(name) = pane
-                        .display_agent
-                        .as_deref()
-                        .or(pane.agent.as_deref())
-                        .or(pane.title.as_deref())
-                    {
-                        terminal.set_agent_name(name.to_string());
+                        if let Some(name) = &agent.name {
+                            terminal.set_agent_name(name.clone());
+                        }
                     }
+                    let _ = terminal.set_agent_metadata(crate::terminal::AgentMetadataReport {
+                        source: "fleet-snapshot".to_string(),
+                        agent_label: pane.agent.clone(),
+                        applies_to_source: None,
+                        title: agent
+                            .and_then(|agent| agent.title.clone())
+                            .or_else(|| pane.title.clone()),
+                        display_agent: agent
+                            .and_then(|agent| agent.display_agent.clone())
+                            .or_else(|| pane.display_agent.clone()),
+                        state_labels: agent
+                            .map(|agent| agent.state_labels.clone())
+                            .unwrap_or_else(|| pane.state_labels.clone()),
+                        clear_title: false,
+                        clear_display_agent: false,
+                        clear_state_labels: false,
+                        ttl: None,
+                        seq: Some(agent.map_or(pane.revision, |agent| agent.revision)),
+                    });
                     if let Some(label) = pane.label.clone() {
                         terminal.set_manual_label(label);
                     }
-                    terminal.set_terminal_title(
-                        pane.terminal_title.clone().or_else(|| pane.title.clone()),
-                    );
+                    terminal.set_terminal_title(pane.terminal_title.clone());
                     patch_metadata_tokens(&mut terminal.metadata_tokens, &pane.tokens);
                     if pane.focused
                         || snapshot.focused_pane_id.as_deref() == Some(pane.pane_id.as_str())
@@ -1331,6 +1809,7 @@ fn build_sidebar_state(
                     }
                     pane_terminals.push((terminal_id.clone(), seen));
                     terminals.push((terminal_id, terminal));
+                    tab_projected_pane_ids.push(projected_pane_id);
                     tab_remote_pane_ids.push(pane.pane_id.clone());
                 }
 
@@ -1338,13 +1817,22 @@ fn build_sidebar_state(
                     label: Some(tab.label.clone()),
                     number: tab.number,
                     pane_terminals,
+                    pane_ids: tab_projected_pane_ids,
                     focused_pane_idx,
                 });
                 remote_pane_ids.push(tab_remote_pane_ids);
             }
 
             if placeholder_tabs.is_empty() {
-                let terminal_id = crate::terminal::TerminalId::alloc();
+                let projection_key =
+                    format!("{}\0{}\0empty", instance.id, workspace_info.workspace_id);
+                let terminal_id = projected_terminal_ids
+                    .entry(projection_key.clone())
+                    .or_insert_with(crate::terminal::TerminalId::alloc)
+                    .clone();
+                let pane_id = *projected_pane_ids
+                    .entry(projection_key)
+                    .or_insert_with(crate::layout::PaneId::alloc);
                 let (workspace_state, seen) = native_agent_state(workspace_info.agent_status);
                 let mut terminal =
                     crate::terminal::TerminalState::new(terminal_id.clone(), "/".into());
@@ -1353,6 +1841,7 @@ fn build_sidebar_state(
                     label: None,
                     number: 1,
                     pane_terminals: vec![(terminal_id.clone(), seen)],
+                    pane_ids: vec![pane_id],
                     focused_pane_idx: Some(0),
                 });
                 remote_pane_ids.push(Vec::new());
@@ -1411,13 +1900,13 @@ fn build_sidebar_state(
 
             app.workspaces.push(workspace);
 
-            if instance_idx == state.active
+            if instance_idx == active_instance
                 && (workspace_info.focused
                     || snapshot.focused_workspace_id.as_deref()
                         == Some(workspace_info.workspace_id.as_str()))
             {
                 active_workspace = Some(ws_idx);
-            } else if instance_idx == state.active && active_workspace.is_none() {
+            } else if instance_idx == active_instance && active_workspace.is_none() {
                 active_workspace = Some(ws_idx);
             }
         }
@@ -1425,12 +1914,6 @@ fn build_sidebar_state(
 
     app.active = active_workspace.or_else(|| (!app.workspaces.is_empty()).then_some(0));
     app.selected = app.active.unwrap_or(0);
-    app.workspace_scroll = crate::ui::normalized_workspace_scroll(&app, app.view.sidebar_rect, 0);
-    app.view.workspace_card_areas = if app.sidebar_collapsed {
-        Vec::new()
-    } else {
-        crate::ui::compute_workspace_card_areas(&app, app.view.sidebar_rect)
-    };
 
     (app, workspace_routes, tab_routes, pane_routes)
 }
@@ -1443,17 +1926,6 @@ fn native_agent_state(status: AgentStatus) -> (crate::detect::AgentState, bool) 
         AgentStatus::Idle => (crate::detect::AgentState::Idle, true),
         AgentStatus::Unknown => (crate::detect::AgentState::Unknown, true),
     }
-}
-
-fn agent_display_name(agent: &crate::api::schema::AgentInfo) -> String {
-    agent
-        .name
-        .as_deref()
-        .or(agent.display_agent.as_deref())
-        .or(agent.agent.as_deref())
-        .or(agent.title.as_deref())
-        .unwrap_or(&agent.pane_id)
-        .to_string()
 }
 
 fn patch_metadata_tokens(
@@ -1474,39 +1946,32 @@ fn compose_frame(
     content: Option<&FrameData>,
     width: u16,
     height: u16,
-    sidebar_width: u16,
+    content_rect: Rect,
 ) -> FrameData {
-    let blank = content
-        .and_then(|frame| frame.cells.first())
-        .cloned()
-        .map(|mut cell| {
-            cell.symbol = " ".to_string();
-            cell.skip = false;
-            cell.hyperlink = None;
-            cell
-        })
-        .unwrap_or(CellData {
-            symbol: " ".to_string(),
-            fg: 0,
-            bg: 0,
-            modifier: 0,
-            skip: false,
-            hyperlink: None,
-        });
+    let blank = CellData {
+        symbol: " ".to_string(),
+        fg: 0,
+        bg: 0,
+        modifier: 0,
+        skip: false,
+        hyperlink: None,
+    };
     let mut cells = vec![blank; width as usize * height as usize];
 
     let mut cursor = None;
     let mut hyperlinks = Vec::new();
     if let Some(content) = content {
-        let available = width.saturating_sub(sidebar_width);
-        for row in 0..height.min(content.height) {
-            for col in 0..available.min(content.width) {
-                cells[row as usize * width as usize + sidebar_width as usize + col as usize] =
+        for row in 0..content_rect.height.min(content.height) {
+            for col in 0..content_rect.width.min(content.width) {
+                let host_row = content_rect.y.saturating_add(row);
+                let host_col = content_rect.x.saturating_add(col);
+                cells[host_row as usize * width as usize + host_col as usize] =
                     content.cells[row as usize * content.width as usize + col as usize].clone();
             }
         }
         cursor = content.cursor.clone().map(|mut cursor| {
-            cursor.x = cursor.x.saturating_add(sidebar_width);
+            cursor.x = cursor.x.saturating_add(content_rect.x);
+            cursor.y = cursor.y.saturating_add(content_rect.y);
             cursor
         });
         hyperlinks = content.hyperlinks.clone();
@@ -1519,7 +1984,9 @@ fn compose_frame(
         cursor,
         hyperlinks,
         graphics: content
-            .map(|frame| shift_graphics_columns(&frame.graphics, sidebar_width))
+            .map(|frame| {
+                shift_graphics_coordinates(&frame.graphics, content_rect.x, content_rect.y)
+            })
             .unwrap_or_default(),
     }
 }
@@ -1527,8 +1994,8 @@ fn compose_frame(
 /// Kitty image placements use absolute cursor coordinates. Content-surface
 /// servers encode those coordinates relative to column zero, so shift each
 /// cursor-position command past the aggregate sidebar before blitting it.
-fn shift_graphics_columns(graphics: &[u8], offset: u16) -> Vec<u8> {
-    if graphics.is_empty() || offset == 0 {
+fn shift_graphics_coordinates(graphics: &[u8], column_offset: u16, row_offset: u16) -> Vec<u8> {
+    if graphics.is_empty() || (column_offset == 0 && row_offset == 0) {
         return graphics.to_vec();
     }
     let mut shifted = Vec::with_capacity(graphics.len());
@@ -1541,6 +2008,7 @@ fn shift_graphics_columns(graphics: &[u8], offset: u16) -> Vec<u8> {
             while graphics.get(index).is_some_and(u8::is_ascii_digit) {
                 index += 1;
             }
+            let row_end = index;
             if index > row_start && graphics.get(index) == Some(&b';') {
                 index += 1;
                 let column_start = index;
@@ -1548,12 +2016,21 @@ fn shift_graphics_columns(graphics: &[u8], offset: u16) -> Vec<u8> {
                     index += 1;
                 }
                 if index > column_start && graphics.get(index) == Some(&b'H') {
-                    shifted.extend_from_slice(&graphics[sequence_start..column_start]);
+                    shifted.extend_from_slice(&graphics[sequence_start..row_start]);
+                    let row = std::str::from_utf8(&graphics[row_start..row_end])
+                        .ok()
+                        .and_then(|value| value.trim_end_matches(';').parse::<u16>().ok())
+                        .unwrap_or(1);
+                    shifted
+                        .extend_from_slice(row.saturating_add(row_offset).to_string().as_bytes());
+                    shifted.push(b';');
                     let column = std::str::from_utf8(&graphics[column_start..index])
                         .ok()
                         .and_then(|value| value.parse::<u16>().ok())
                         .unwrap_or(1);
-                    shifted.extend_from_slice(column.saturating_add(offset).to_string().as_bytes());
+                    shifted.extend_from_slice(
+                        column.saturating_add(column_offset).to_string().as_bytes(),
+                    );
                     shifted.push(b'H');
                     cursor = index + 1;
                     continue;

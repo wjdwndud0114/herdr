@@ -1466,6 +1466,52 @@ fn action_for_key(
         .or_else(|| indexed_navigation_action(state, &key, dispatch))
 }
 
+pub(super) fn client_prefix_navigation_action(
+    state: &AppState,
+    key: &TerminalKey,
+) -> Option<NavigateAction> {
+    non_indexed_action_for_key(state, key, BindingDispatch::Prefix)
+        .or_else(|| indexed_navigation_action(state, key, BindingDispatch::Prefix))
+}
+
+pub(super) fn client_action_runs_on_active_content(action: NavigateAction) -> bool {
+    matches!(
+        action,
+        NavigateAction::NewWorktree
+            | NavigateAction::OpenWorktree
+            | NavigateAction::RemoveWorktree
+            | NavigateAction::SwitchTab(_)
+            | NavigateAction::NewTab
+            | NavigateAction::RenameTab
+            | NavigateAction::PreviousTab
+            | NavigateAction::NextTab
+            | NavigateAction::CloseTab
+            | NavigateAction::RenamePane
+            | NavigateAction::FocusPaneLeft
+            | NavigateAction::FocusPaneDown
+            | NavigateAction::FocusPaneUp
+            | NavigateAction::FocusPaneRight
+            | NavigateAction::SwapPaneLeft
+            | NavigateAction::SwapPaneDown
+            | NavigateAction::SwapPaneUp
+            | NavigateAction::SwapPaneRight
+            | NavigateAction::SplitVertical
+            | NavigateAction::SplitHorizontal
+            | NavigateAction::ClosePane
+            | NavigateAction::EditScrollback
+            | NavigateAction::CopyMode
+            | NavigateAction::Zoom
+            | NavigateAction::EnterResizeMode
+            | NavigateAction::CyclePaneNext
+            | NavigateAction::CyclePanePrevious
+            | NavigateAction::LastPane
+    )
+}
+
+pub(super) fn client_prefix_custom_command_matches(state: &AppState, key: &TerminalKey) -> bool {
+    command_for_key(state, key, BindingDispatch::Prefix).is_some()
+}
+
 fn non_indexed_action_for_key(
     state: &AppState,
     key: &TerminalKey,

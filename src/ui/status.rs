@@ -14,6 +14,16 @@ use crate::{
     detect::AgentState,
 };
 
+static WORKING_ANIMATION_FRAME: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(u8::MAX);
+
+pub(crate) fn set_working_animation_frame(frame: Option<u8>) {
+    WORKING_ANIMATION_FRAME.store(
+        frame.map(|value| value % 4).unwrap_or(u8::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 pub(crate) fn copy_feedback_rect(
     area: Rect,
     feedback: &CopyFeedback,
@@ -198,6 +208,13 @@ pub(super) fn state_icon_symbol(
     seen: bool,
     indicator_style: StatusIndicatorStyle,
 ) -> &'static str {
+    let animation_frame = WORKING_ANIMATION_FRAME.load(std::sync::atomic::Ordering::Relaxed);
+    if state == AgentState::Working && animation_frame != u8::MAX {
+        return match indicator_style {
+            StatusIndicatorStyle::Dots => ["⠋", "⠹", "⠼", "⠦"][animation_frame as usize % 4],
+            StatusIndicatorStyle::Symbols => ["◐", "◓", "◑", "◒"][animation_frame as usize % 4],
+        };
+    }
     match (indicator_style, state, seen) {
         (StatusIndicatorStyle::Dots, AgentState::Blocked, _) => "●",
         (StatusIndicatorStyle::Dots, AgentState::Working, _) => "●",
