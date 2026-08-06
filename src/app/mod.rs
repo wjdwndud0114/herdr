@@ -250,7 +250,7 @@ fn load_plugin_registry(no_session: bool) -> crate::app::state::InstalledPluginR
         .collect()
 }
 
-fn agent_panel_sort_from_config(
+pub(crate) fn agent_panel_sort_from_config(
     sort: crate::config::AgentPanelSortConfig,
 ) -> state::AgentPanelSort {
     match sort {
@@ -305,7 +305,7 @@ fn sibling_theme_names(name: &str) -> (String, String) {
     }
 }
 
-fn theme_runtime_config(
+pub(crate) fn theme_runtime_config(
     config: &crate::config::Config,
     use_legacy_ui_accent: bool,
 ) -> state::ThemeRuntimeConfig {
@@ -361,7 +361,7 @@ fn resolve_palette_for_theme_name(
     palette
 }
 
-fn resolve_effective_theme(
+pub(crate) fn resolve_effective_theme(
     runtime: &state::ThemeRuntimeConfig,
     appearance: Option<crate::terminal_theme::HostAppearance>,
 ) -> (state::Palette, String) {

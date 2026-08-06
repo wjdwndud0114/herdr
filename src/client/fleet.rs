@@ -1,15 +1,15 @@
+use std::collections::HashMap;
 use std::io::{self, Write as _};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{MouseButton, MouseEventKind};
 use interprocess::local_socket::traits::Stream as _;
 use interprocess::TryClone as _;
-use ratatui::buffer::Buffer;
+use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
 
 use super::{ClientError, ClientLoopEvent};
 use crate::api::client::{ApiClient, ConnectionTarget};
@@ -69,6 +69,18 @@ struct FleetState {
     blit_encoder: crate::protocol::render_ansi::BlitEncoder,
     repaint_pending: bool,
     sound_config: crate::config::SoundConfig,
+    visual: FleetVisualConfig,
+}
+
+struct FleetVisualConfig {
+    palette: crate::app::state::Palette,
+    theme_name: String,
+    theme_runtime: crate::app::state::ThemeRuntimeConfig,
+    status_indicators: crate::config::StatusIndicatorStyle,
+    agent_panel_sort: crate::app::state::AgentPanelSort,
+    sidebar_agents: crate::config::AgentsSidebarConfig,
+    sidebar_spaces: crate::config::SpacesSidebarConfig,
+    mouse_capture: bool,
 }
 
 pub(super) fn run() -> io::Result<()> {
@@ -80,6 +92,20 @@ pub(super) fn run() -> io::Result<()> {
         loaded.config.ui.sidebar_min_width,
         loaded.config.ui.sidebar_max_width,
     );
+    let theme_runtime = crate::app::theme_runtime_config(&loaded.config, true);
+    let (palette, theme_name) = crate::app::resolve_effective_theme(&theme_runtime, None);
+    let visual = FleetVisualConfig {
+        palette,
+        theme_name,
+        theme_runtime,
+        status_indicators: loaded.config.ui.status_indicators,
+        agent_panel_sort: crate::app::agent_panel_sort_from_config(
+            loaded.config.ui.agent_panel_sort,
+        ),
+        sidebar_agents: loaded.config.ui.sidebar.agents.clone(),
+        sidebar_spaces: loaded.config.ui.sidebar.spaces.clone(),
+        mouse_capture,
+    };
     let (cols, rows, _, _) = super::initial_terminal_geometry(false);
     let content_cols = cols.saturating_sub(sidebar_width).max(2);
     let registry = crate::fleet::load();
@@ -149,6 +175,7 @@ pub(super) fn run() -> io::Result<()> {
         mouse_capture,
         should_quit,
         loaded.config.ui.sound,
+        visual,
     ));
 
     drop(terminal_guard);
@@ -188,6 +215,7 @@ async fn run_loop(
     mouse_capture: bool,
     should_quit: Arc<AtomicBool>,
     sound_config: crate::config::SoundConfig,
+    visual: FleetVisualConfig,
 ) -> Result<(), ClientError> {
     let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(256);
     let (fleet_tx, mut fleet_rx) = tokio::sync::mpsc::channel::<FleetEvent>(256);
@@ -244,6 +272,7 @@ async fn run_loop(
         blit_encoder: crate::protocol::render_ansi::BlitEncoder::new(),
         repaint_pending: true,
         sound_config,
+        visual,
     };
     let mut current_cols = cols;
     let mut current_rows = rows;
@@ -536,144 +565,282 @@ fn render_sidebar(
     width: u16,
     height: u16,
 ) -> (FrameData, Vec<Option<SidebarHit>>) {
-    let area = Rect::new(0, 0, width, height);
-    let mut buffer = Buffer::empty(area);
-    let background = Style::default().fg(Color::Gray).bg(Color::Rgb(24, 24, 31));
-    buffer.set_style(area, background);
-    let mut hits = vec![None; height as usize];
-    let mut row = 0u16;
-    put_line(
-        &mut buffer,
-        width,
-        row,
-        " HERDR FLEET",
-        Style::default()
-            .fg(Color::Cyan)
-            .bg(Color::Rgb(24, 24, 31))
-            .add_modifier(Modifier::BOLD),
-    );
-    row += 2;
-
-    for (index, instance) in state.instances.iter().enumerate() {
-        if row >= height {
-            break;
-        }
-        let active = index == state.active;
-        let online = instance.writer.is_some();
-        let marker = if active { ">" } else { " " };
-        let state_marker = if online { "+" } else { "-" };
-        let label = format!("{marker}{state_marker} {}", instance.name);
-        let style = if active {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-                .fg(if online {
-                    Color::White
-                } else {
-                    Color::DarkGray
-                })
-                .bg(Color::Rgb(24, 24, 31))
-                .add_modifier(Modifier::BOLD)
-        };
-        put_line(&mut buffer, width, row, &label, style);
-        hits[row as usize] = Some(SidebarHit::Instance { index });
-        row += 1;
-
-        if let Some(snapshot) = &instance.snapshot {
-            for workspace in &snapshot.workspaces {
-                if row >= height {
-                    break;
-                }
-                let label = format!(
-                    "  {} {}",
-                    status_marker(workspace.agent_status),
-                    workspace.label
-                );
-                put_line(&mut buffer, width, row, &label, background);
-                hits[row as usize] = Some(SidebarHit::Workspace {
-                    index,
-                    workspace_id: workspace.workspace_id.clone(),
-                });
-                row += 1;
-
-                for agent in snapshot
-                    .agents
-                    .iter()
-                    .filter(|agent| agent.workspace_id == workspace.workspace_id)
-                {
-                    if row >= height {
-                        break;
-                    }
-                    let agent_name = agent
-                        .name
-                        .as_deref()
-                        .or(agent.display_agent.as_deref())
-                        .or(agent.agent.as_deref())
-                        .unwrap_or(&agent.pane_id);
-                    let label = format!("    {} {agent_name}", status_marker(agent.agent_status));
-                    put_line(
-                        &mut buffer,
-                        width,
-                        row,
-                        &label,
-                        Style::default()
-                            .fg(status_color(agent.agent_status))
-                            .bg(Color::Rgb(24, 24, 31)),
-                    );
-                    hits[row as usize] = Some(SidebarHit::Agent {
-                        index,
-                        target: agent.pane_id.clone(),
-                    });
-                    row += 1;
-                }
-            }
-        } else if let Some(error) = &instance.error {
-            put_line(
-                &mut buffer,
+    if width == 0 || height == 0 {
+        return (
+            FrameData {
+                cells: Vec::new(),
                 width,
-                row,
-                &format!("  {error}"),
-                Style::default().fg(Color::Red).bg(Color::Rgb(24, 24, 31)),
-            );
-            row += 1;
-        }
-        row = row.saturating_add(1);
+                height,
+                cursor: None,
+                hyperlinks: Vec::new(),
+                graphics: Vec::new(),
+            },
+            vec![None; height as usize],
+        );
     }
 
+    let (app, workspace_routes, agent_routes) = build_sidebar_state(state, width, height);
+    let backend = TestBackend::new(width, height);
+    let mut terminal = ratatui::Terminal::new(backend)
+        .expect("fleet sidebar TestBackend construction should not fail");
+    terminal
+        .draw(|frame| crate::ui::render_client_sidebar(&app, frame))
+        .expect("fleet sidebar render should not fail");
+
+    let mut hits = vec![None; height as usize];
+    for card in &app.view.workspace_card_areas {
+        let Some(hit) = workspace_routes.get(&card.ws_idx) else {
+            continue;
+        };
+        for row in card.rect.y..card.rect.y.saturating_add(card.rect.height).min(height) {
+            hits[row as usize] = Some(hit.clone());
+        }
+    }
+
+    let (_, detail_area) =
+        crate::ui::expanded_sidebar_sections(app.view.sidebar_rect, app.sidebar_section_split);
+    let metrics = crate::ui::agent_panel_scroll_metrics(&app, detail_area);
+    let body =
+        crate::ui::agent_panel_body_rect(detail_area, crate::ui::should_show_scrollbar(metrics));
+    let entries = crate::ui::agent_panel_entries(&app);
+    let scroll = app.agent_panel_scroll.min(metrics.max_offset_from_bottom);
+    let mut row_y = body.y;
+    let body_bottom = body.y.saturating_add(body.height);
+    for (entry_idx, entry) in entries.iter().enumerate().skip(scroll) {
+        let entry_height = crate::ui::agent_entry_height_in_body(&app, entry, body.height);
+        if row_y.saturating_add(entry_height) > body_bottom {
+            break;
+        }
+        if let Some(hit) = agent_routes.get(&(entry.ws_idx, entry.pane_id)) {
+            for row in row_y..row_y.saturating_add(entry_height).min(height) {
+                hits[row as usize] = Some(hit.clone());
+            }
+        }
+        row_y = row_y
+            .saturating_add(entry_height)
+            .saturating_add(crate::ui::agent_entry_gap(&app, entry_idx, entries.len()))
+            .min(body_bottom);
+    }
+
+    let buffer = terminal.backend().buffer().clone();
     (
         FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, None, &[]),
         hits,
     )
 }
 
-fn put_line(buffer: &mut Buffer, width: u16, row: u16, text: &str, style: Style) {
-    if width == 0 || row >= buffer.area.height {
-        return;
+fn build_sidebar_state(
+    state: &FleetState,
+    width: u16,
+    height: u16,
+) -> (
+    crate::app::AppState,
+    HashMap<usize, SidebarHit>,
+    HashMap<(usize, crate::layout::PaneId), SidebarHit>,
+) {
+    let mut app = crate::app::AppState::empty_for_client_rendering();
+    app.sidebar_width = width;
+    app.default_sidebar_width = state.sidebar_width;
+    app.sidebar_min_width = width;
+    app.sidebar_max_width = width;
+    app.sidebar_section_split = 0.5;
+    app.sidebar_collapsed = false;
+    app.status_indicators = state.visual.status_indicators;
+    app.agent_panel_sort = state.visual.agent_panel_sort;
+    app.sidebar_agents = state.visual.sidebar_agents.clone();
+    app.sidebar_spaces = state.visual.sidebar_spaces.clone();
+    app.mouse_capture = state.visual.mouse_capture;
+    app.palette = state.visual.palette.clone();
+    app.theme_name = state.visual.theme_name.clone();
+    app.theme_runtime = state.visual.theme_runtime.clone();
+    app.mode = crate::app::Mode::Terminal;
+    app.view.layout = crate::app::state::ViewLayout::Desktop;
+    app.view.sidebar_rect = Rect::new(0, 0, width, height);
+    app.view.terminal_area = Rect::new(width, 0, 0, height);
+
+    let mut workspace_routes = HashMap::new();
+    let mut agent_routes = HashMap::new();
+    let mut active_workspace = None;
+
+    for (instance_idx, instance) in state.instances.iter().enumerate() {
+        let snapshot_workspaces = instance
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.workspaces.as_slice())
+            .unwrap_or(&[]);
+
+        if snapshot_workspaces.is_empty() {
+            let status = if let Some(error) = &instance.error {
+                error.as_str()
+            } else if instance.writer.is_some() {
+                "no spaces"
+            } else {
+                "connecting"
+            };
+            let terminal_id = crate::terminal::TerminalId::alloc();
+            let (workspace, _) = crate::workspace::Workspace::sidebar_placeholder(
+                format!("fleet:{}:empty", instance.id),
+                format!("{} · {status}", instance.name),
+                None,
+                vec![(terminal_id.clone(), true)],
+                None,
+            );
+            let ws_idx = app.workspaces.len();
+            app.terminals.insert(
+                terminal_id.clone(),
+                crate::terminal::TerminalState::new(terminal_id, "/".into()),
+            );
+            app.workspaces.push(workspace);
+            workspace_routes.insert(
+                ws_idx,
+                SidebarHit::Instance {
+                    index: instance_idx,
+                },
+            );
+            if instance_idx == state.active && active_workspace.is_none() {
+                active_workspace = Some(ws_idx);
+            }
+            continue;
+        }
+
+        let snapshot = instance.snapshot.as_ref().expect("snapshot checked above");
+        for workspace_info in snapshot_workspaces {
+            let agents = snapshot
+                .agents
+                .iter()
+                .filter(|agent| agent.workspace_id == workspace_info.workspace_id)
+                .collect::<Vec<_>>();
+            let mut terminals = Vec::new();
+            let mut pane_terminals = Vec::new();
+            let mut focused_pane_idx = None;
+
+            for agent in &agents {
+                let terminal_id = crate::terminal::TerminalId::alloc();
+                let (agent_state, seen) = native_agent_state(agent.agent_status);
+                let mut terminal = crate::terminal::TerminalState::new(
+                    terminal_id.clone(),
+                    agent
+                        .foreground_cwd
+                        .as_deref()
+                        .or(agent.cwd.as_deref())
+                        .unwrap_or("/")
+                        .into(),
+                );
+                terminal.state = agent_state;
+                terminal.last_agent_state_change_seq = Some(agent.state_change_seq);
+                terminal.detected_agent = agent
+                    .agent
+                    .as_deref()
+                    .or(agent.display_agent.as_deref())
+                    .and_then(crate::detect::parse_agent_label);
+                terminal.set_agent_name(agent_display_name(agent));
+                terminal.set_terminal_title(agent.terminal_title.clone());
+                patch_metadata_tokens(&mut terminal.metadata_tokens, &agent.tokens);
+                if agent.focused {
+                    focused_pane_idx = Some(pane_terminals.len());
+                }
+                pane_terminals.push((terminal_id.clone(), seen));
+                terminals.push((terminal_id, terminal));
+            }
+
+            if pane_terminals.is_empty() {
+                let terminal_id = crate::terminal::TerminalId::alloc();
+                let (workspace_state, seen) = native_agent_state(workspace_info.agent_status);
+                let mut terminal =
+                    crate::terminal::TerminalState::new(terminal_id.clone(), "/".into());
+                terminal.state = workspace_state;
+                pane_terminals.push((terminal_id.clone(), seen));
+                terminals.push((terminal_id, terminal));
+            }
+
+            let label = format!("{} · {}", instance.name, workspace_info.label);
+            let (mut workspace, pane_ids) = crate::workspace::Workspace::sidebar_placeholder(
+                format!("fleet:{}:{}", instance.id, workspace_info.workspace_id),
+                label,
+                workspace_info.tokens.get("branch").cloned(),
+                pane_terminals,
+                focused_pane_idx,
+            );
+            let mut workspace_tokens = workspace_info.tokens.clone();
+            workspace_tokens.insert("host".to_string(), instance.name.clone());
+            patch_metadata_tokens(&mut workspace.metadata_tokens, &workspace_tokens);
+
+            let ws_idx = app.workspaces.len();
+            for (terminal_id, terminal) in terminals {
+                app.terminals.insert(terminal_id, terminal);
+            }
+            app.workspaces.push(workspace);
+            workspace_routes.insert(
+                ws_idx,
+                SidebarHit::Workspace {
+                    index: instance_idx,
+                    workspace_id: workspace_info.workspace_id.clone(),
+                },
+            );
+            for (pane_id, agent) in pane_ids.iter().zip(agents) {
+                agent_routes.insert(
+                    (ws_idx, *pane_id),
+                    SidebarHit::Agent {
+                        index: instance_idx,
+                        target: agent.pane_id.clone(),
+                    },
+                );
+            }
+
+            if instance_idx == state.active
+                && (workspace_info.focused
+                    || snapshot.focused_workspace_id.as_deref()
+                        == Some(workspace_info.workspace_id.as_str()))
+            {
+                active_workspace = Some(ws_idx);
+            } else if instance_idx == state.active && active_workspace.is_none() {
+                active_workspace = Some(ws_idx);
+            }
+        }
     }
-    buffer.set_stringn(0, row, text, width as usize, style);
+
+    app.active = active_workspace.or_else(|| (!app.workspaces.is_empty()).then_some(0));
+    app.selected = app.active.unwrap_or(0);
+    app.workspace_scroll = crate::ui::normalized_workspace_scroll(&app, app.view.sidebar_rect, 0);
+    app.view.workspace_card_areas =
+        crate::ui::compute_workspace_card_areas(&app, app.view.sidebar_rect);
+
+    (app, workspace_routes, agent_routes)
 }
 
-fn status_marker(status: AgentStatus) -> &'static str {
+fn native_agent_state(status: AgentStatus) -> (crate::detect::AgentState, bool) {
     match status {
-        AgentStatus::Working => "*",
-        AgentStatus::Blocked => "!",
-        AgentStatus::Done => "+",
-        AgentStatus::Idle => ".",
-        AgentStatus::Unknown => "?",
+        AgentStatus::Working => (crate::detect::AgentState::Working, true),
+        AgentStatus::Blocked => (crate::detect::AgentState::Blocked, true),
+        AgentStatus::Done => (crate::detect::AgentState::Idle, false),
+        AgentStatus::Idle => (crate::detect::AgentState::Idle, true),
+        AgentStatus::Unknown => (crate::detect::AgentState::Unknown, true),
     }
 }
 
-fn status_color(status: AgentStatus) -> Color {
-    match status {
-        AgentStatus::Working => Color::Yellow,
-        AgentStatus::Blocked => Color::Red,
-        AgentStatus::Done => Color::Green,
-        AgentStatus::Idle => Color::Gray,
-        AgentStatus::Unknown => Color::DarkGray,
-    }
+fn agent_display_name(agent: &crate::api::schema::AgentInfo) -> String {
+    agent
+        .name
+        .as_deref()
+        .or(agent.display_agent.as_deref())
+        .or(agent.agent.as_deref())
+        .or(agent.title.as_deref())
+        .unwrap_or(&agent.pane_id)
+        .to_string()
+}
+
+fn patch_metadata_tokens(
+    target: &mut crate::metadata_tokens::MetadataTokens,
+    values: &HashMap<String, String>,
+) {
+    target.patch(
+        values
+            .iter()
+            .map(|(key, value)| (key.clone(), Some(value.clone())))
+            .collect(),
+        None,
+        Instant::now(),
+    );
 }
 
 fn compose_frame(
