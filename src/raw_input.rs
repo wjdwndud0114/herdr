@@ -15,7 +15,6 @@ pub fn parse_raw_input_bytes(data: &[u8]) -> Vec<RawInputEvent> {
 }
 
 /// A raw input event paired with the byte range it consumed from the original buffer.
-#[cfg(test)]
 #[derive(Debug)]
 pub struct RawInputEventWithRange {
     /// The parsed event.
@@ -33,7 +32,6 @@ pub struct RawInputEventWithRange {
 /// Unlike `parse_raw_input_bytes_sync`, this preserves the byte offset for each
 /// event, allowing callers to write only the specific bytes for each event
 /// instead of the entire input buffer.
-#[cfg(test)]
 pub fn parse_raw_input_bytes_with_ranges(data: &[u8]) -> Vec<RawInputEventWithRange> {
     let mut buffer = data.to_vec();
     let mut events = Vec::new();
