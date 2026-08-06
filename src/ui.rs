@@ -103,12 +103,6 @@ use crate::app::state::ViewLayout;
 use crate::app::{AppState, Mode};
 use crate::terminal::TerminalRuntimeRegistry;
 
-/// Render the standard desktop sidebar for a client-owned aggregate view.
-pub(crate) fn render_client_sidebar(app: &AppState, frame: &mut Frame) {
-    let terminal_runtimes = TerminalRuntimeRegistry::new();
-    render_sidebar(app, &terminal_runtimes, frame, app.view.sidebar_rect);
-}
-
 /// Render client-owned navigation and overlays on top of an existing content
 /// frame. The aggregate fleet client supplies the pane pixels while reusing the
 /// exact sidebar, menus, and dialogs from the normal TUI.

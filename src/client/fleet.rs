@@ -131,7 +131,16 @@ pub(super) fn run() -> io::Result<()> {
         mouse_capture,
     };
     let (cols, rows, _, _) = super::initial_terminal_geometry(false);
-    let content_cols = cols.saturating_sub(sidebar_width).max(2);
+    let initial_sidebar_width = if visual.sidebar_start_collapsed {
+        match visual.sidebar_collapsed_mode {
+            crate::config::SidebarCollapsedModeConfig::Compact => 4,
+            crate::config::SidebarCollapsedModeConfig::Hidden => 0,
+        }
+    } else {
+        sidebar_width
+    }
+    .min(cols.saturating_sub(2));
+    let content_cols = cols.saturating_sub(initial_sidebar_width).max(2);
     let registry = crate::fleet::load();
 
     let mut bridges = Vec::new();
@@ -478,107 +487,7 @@ fn handle_input(
 ) -> Result<(), ClientError> {
     match input {
         ClientLoopEvent::StdinInput(data) => {
-            let events = crate::raw_input::parse_raw_input_bytes_sync(&data);
-            if events.len() > 1
-                && events
-                    .iter()
-                    .all(|event| matches!(event, crate::raw_input::RawInputEvent::Mouse(_)))
-            {
-                let mut sidebar_consumed = false;
-                for event in &events {
-                    let crate::raw_input::RawInputEvent::Mouse(mouse) = event else {
-                        unreachable!("fleet mouse batch was checked above");
-                    };
-                    sidebar_consumed |=
-                        handle_mouse_input(state, *mouse, current_cols, current_rows)?;
-                }
-                if sidebar_consumed {
-                    state.repaint_pending = true;
-                    render(state, current_cols, current_rows);
-                }
-                return Ok(());
-            }
-
-            if events.len() > 1
-                && events
-                    .iter()
-                    .all(|event| matches!(event, crate::raw_input::RawInputEvent::Key(_)))
-            {
-                let previous_width = current_sidebar_width(state, current_cols);
-                let mut actions = Vec::with_capacity(events.len());
-                for event in &events {
-                    let crate::raw_input::RawInputEvent::Key(key) = event else {
-                        unreachable!("fleet key batch was checked above");
-                    };
-                    match crate::app::handle_client_sidebar_key(&mut state.sidebar, key.clone()) {
-                        crate::app::ClientSidebarInput::Forward => {
-                            actions.clear();
-                            break;
-                        }
-                        crate::app::ClientSidebarInput::Consumed(action) => actions.push(action),
-                    }
-                }
-                if !actions.is_empty() {
-                    for action in actions.into_iter().flatten() {
-                        dispatch_sidebar_action(state, action);
-                    }
-                    update_sidebar_geometry(state, current_cols, current_rows);
-                    if current_sidebar_width(state, current_cols) != previous_width {
-                        resize_content_streams(state, current_cols, current_rows)?;
-                    }
-                    state.repaint_pending = true;
-                    render(state, current_cols, current_rows);
-                    return Ok(());
-                }
-            }
-
-            if let [event] = events.as_slice() {
-                match event {
-                    crate::raw_input::RawInputEvent::Mouse(mouse) => {
-                        if handle_mouse_input(state, *mouse, current_cols, current_rows)? {
-                            state.repaint_pending = true;
-                            render(state, current_cols, current_rows);
-                            return Ok(());
-                        }
-                    }
-                    crate::raw_input::RawInputEvent::Key(key) => {
-                        match crate::app::handle_client_sidebar_key(&mut state.sidebar, key.clone())
-                        {
-                            crate::app::ClientSidebarInput::Forward => {}
-                            crate::app::ClientSidebarInput::Consumed(action) => {
-                                let previous_width = current_sidebar_width(state, current_cols);
-                                if let Some(action) = action {
-                                    dispatch_sidebar_action(state, action);
-                                }
-                                update_sidebar_geometry(state, current_cols, current_rows);
-                                if current_sidebar_width(state, current_cols) != previous_width {
-                                    resize_content_streams(state, current_cols, current_rows)?;
-                                }
-                                state.repaint_pending = true;
-                                render(state, current_cols, current_rows);
-                                return Ok(());
-                            }
-                        }
-                    }
-                    crate::raw_input::RawInputEvent::Text(text) => {
-                        if crate::app::handle_client_sidebar_text(&mut state.sidebar, text.as_str())
-                        {
-                            state.repaint_pending = true;
-                            render(state, current_cols, current_rows);
-                            return Ok(());
-                        }
-                    }
-                    crate::raw_input::RawInputEvent::Paste(text) => {
-                        if crate::app::handle_client_sidebar_text(&mut state.sidebar, text) {
-                            state.repaint_pending = true;
-                            render(state, current_cols, current_rows);
-                            return Ok(());
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            write_active(state, ClientMessage::Input { data })
+            route_raw_input(state, data, current_cols, current_rows)
         }
         ClientLoopEvent::Resize(cols, rows, _, _) => {
             update_sidebar_geometry(state, cols, rows);
@@ -591,13 +500,122 @@ fn handle_input(
     }
 }
 
+fn route_raw_input(
+    state: &mut FleetState,
+    data: Vec<u8>,
+    current_cols: u16,
+    current_rows: u16,
+) -> Result<(), ClientError> {
+    let events = crate::raw_input::parse_raw_input_bytes_with_ranges(&data);
+    if events.is_empty() {
+        return write_active(state, ClientMessage::Input { data });
+    }
+
+    let previous_width = current_sidebar_width(state, current_cols);
+    let mut forward = Vec::new();
+    let mut offset = 0usize;
+    let mut shell_changed = false;
+
+    for ranged in events {
+        if ranged.start > offset {
+            forward.extend_from_slice(&data[offset..ranged.start]);
+        }
+        let end = ranged.start.saturating_add(ranged.len).min(data.len());
+        let raw = &data[ranged.start.min(data.len())..end];
+        offset = offset.max(end);
+
+        match ranged.event {
+            crate::raw_input::RawInputEvent::Mouse(mouse) => {
+                flush_active_input(state, &mut forward)?;
+                shell_changed |= handle_mouse_input(state, mouse, current_cols, current_rows)?
+                    == MouseInputRoute::Sidebar;
+            }
+            crate::raw_input::RawInputEvent::Key(key) => {
+                match crate::app::handle_client_sidebar_key(&mut state.sidebar, key) {
+                    crate::app::ClientSidebarInput::Forward => forward.extend_from_slice(raw),
+                    crate::app::ClientSidebarInput::CancelServerPrefix(action) => {
+                        flush_active_input(state, &mut forward)?;
+                        cancel_active_server_prefix(state)?;
+                        if let Some(action) = action {
+                            dispatch_sidebar_action(state, action);
+                        }
+                        shell_changed = true;
+                    }
+                    crate::app::ClientSidebarInput::Consumed(action) => {
+                        if let Some(action) = action {
+                            dispatch_sidebar_action(state, action);
+                        }
+                        shell_changed = true;
+                    }
+                }
+            }
+            crate::raw_input::RawInputEvent::Text(text) => {
+                if crate::app::handle_client_sidebar_text(&mut state.sidebar, text.as_str()) {
+                    shell_changed = true;
+                } else {
+                    forward.extend_from_slice(raw);
+                }
+            }
+            crate::raw_input::RawInputEvent::Paste(text) => {
+                if crate::app::handle_client_sidebar_text(&mut state.sidebar, &text) {
+                    shell_changed = true;
+                } else {
+                    forward.extend_from_slice(raw);
+                }
+            }
+            _ => forward.extend_from_slice(raw),
+        }
+    }
+
+    if offset < data.len() {
+        forward.extend_from_slice(&data[offset..]);
+    }
+    flush_active_input(state, &mut forward)?;
+
+    if shell_changed {
+        update_sidebar_geometry(state, current_cols, current_rows);
+        if current_sidebar_width(state, current_cols) != previous_width {
+            resize_content_streams(state, current_cols, current_rows)?;
+        }
+        state.repaint_pending = true;
+        render(state, current_cols, current_rows);
+    }
+    Ok(())
+}
+
+fn flush_active_input(state: &mut FleetState, data: &mut Vec<u8>) -> Result<(), ClientError> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    write_active(
+        state,
+        ClientMessage::Input {
+            data: std::mem::take(data),
+        },
+    )
+}
+
+fn cancel_active_server_prefix(state: &mut FleetState) -> Result<(), ClientError> {
+    write_active(state, ClientMessage::Input { data: vec![0x1b] })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MouseInputRoute {
+    Sidebar,
+    Content,
+}
+
 fn handle_mouse_input(
     state: &mut FleetState,
     mouse: MouseEvent,
     current_cols: u16,
     current_rows: u16,
-) -> Result<bool, ClientError> {
+) -> Result<MouseInputRoute, ClientError> {
     let sidebar_width = current_sidebar_width(state, current_cols);
+    if state.sidebar.mode == crate::app::Mode::Prefix {
+        cancel_active_server_prefix(state)?;
+        state.sidebar.mode = crate::app::Mode::Terminal;
+    }
     let sidebar_related = state.sidebar.mode != crate::app::Mode::Terminal
         || mouse.column < sidebar_width
         || state.sidebar.drag.is_some();
@@ -609,7 +627,7 @@ fn handle_mouse_input(
         if current_sidebar_width(state, current_cols) != sidebar_width {
             resize_content_streams(state, current_cols, current_rows)?;
         }
-        return Ok(true);
+        return Ok(MouseInputRoute::Sidebar);
     }
 
     if let Some(kind) = mouse_kind(mouse.kind) {
@@ -626,7 +644,7 @@ fn handle_mouse_input(
             },
         )?;
     }
-    Ok(false)
+    Ok(MouseInputRoute::Content)
 }
 
 fn resize_content_streams(state: &mut FleetState, cols: u16, rows: u16) -> Result<(), ClientError> {
@@ -823,9 +841,7 @@ fn render(state: &mut FleetState, cols: u16, rows: u16) {
     }
     update_sidebar_geometry(state, cols, rows);
     let sidebar_width = current_sidebar_width(state, cols);
-    let sidebar = render_sidebar_frame(&state.sidebar, sidebar_width, rows);
     let base = compose_frame(
-        sidebar,
         state.instances[state.active].frame.as_ref(),
         cols,
         rows,
@@ -868,28 +884,6 @@ fn render(state: &mut FleetState, cols: u16, rows: u16) {
     let _ = stdout.flush();
     state.blit_encoder.commit(frame, encoded);
     state.repaint_pending = false;
-}
-
-fn render_sidebar_frame(app: &crate::app::AppState, width: u16, height: u16) -> FrameData {
-    if width == 0 || height == 0 {
-        return FrameData {
-            cells: Vec::new(),
-            width,
-            height,
-            cursor: None,
-            hyperlinks: Vec::new(),
-            graphics: Vec::new(),
-        };
-    }
-
-    let backend = TestBackend::new(width, height);
-    let mut terminal = ratatui::Terminal::new(backend)
-        .expect("fleet sidebar TestBackend construction should not fail");
-    terminal
-        .draw(|frame| crate::ui::render_client_sidebar(app, frame))
-        .expect("fleet sidebar render should not fail");
-    let buffer = terminal.backend().buffer().clone();
-    FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, None, &[])
 }
 
 fn configure_sidebar_state(
@@ -941,13 +935,6 @@ fn sync_sidebar_model(state: &mut FleetState, cols: u16, rows: u16) {
     state.workspace_routes = workspace_routes;
     state.agent_routes = agent_routes;
     update_sidebar_geometry(state, cols, rows);
-    state.sidebar.workspace_scroll = crate::ui::normalized_workspace_scroll(
-        &state.sidebar,
-        state.sidebar.view.sidebar_rect,
-        state.sidebar.workspace_scroll,
-    );
-    state.sidebar.view.workspace_card_areas =
-        crate::ui::compute_workspace_card_areas(&state.sidebar, state.sidebar.view.sidebar_rect);
 }
 
 fn current_app_sidebar_width(app: &crate::app::AppState, cols: u16) -> u16 {
@@ -972,8 +959,31 @@ fn update_sidebar_geometry(state: &mut FleetState, cols: u16, rows: u16) {
     state.sidebar.view.layout = crate::app::state::ViewLayout::Desktop;
     state.sidebar.view.sidebar_rect = Rect::new(0, 0, width, rows);
     state.sidebar.view.terminal_area = Rect::new(width, 0, cols.saturating_sub(width), rows);
-    state.sidebar.view.workspace_card_areas =
-        crate::ui::compute_workspace_card_areas(&state.sidebar, state.sidebar.view.sidebar_rect);
+    if state.sidebar.sidebar_collapsed {
+        state.sidebar.workspace_scroll = state
+            .sidebar
+            .workspace_scroll
+            .min(state.sidebar.workspaces.len().saturating_sub(1));
+        state.sidebar.agent_panel_scroll = 0;
+        state.sidebar.view.workspace_card_areas.clear();
+    } else {
+        state.sidebar.workspace_scroll = crate::ui::normalized_workspace_scroll(
+            &state.sidebar,
+            state.sidebar.view.sidebar_rect,
+            state.sidebar.workspace_scroll,
+        );
+        let (_, detail_area) = crate::ui::expanded_sidebar_sections(
+            state.sidebar.view.sidebar_rect,
+            state.sidebar.sidebar_section_split,
+        );
+        let max_agent_scroll = crate::ui::agent_panel_scroll_metrics(&state.sidebar, detail_area)
+            .max_offset_from_bottom;
+        state.sidebar.agent_panel_scroll = state.sidebar.agent_panel_scroll.min(max_agent_scroll);
+        state.sidebar.view.workspace_card_areas = crate::ui::compute_workspace_card_areas(
+            &state.sidebar,
+            state.sidebar.view.sidebar_rect,
+        );
+    }
 }
 
 fn build_sidebar_state(
@@ -1138,8 +1148,11 @@ fn build_sidebar_state(
     app.active = active_workspace.or_else(|| (!app.workspaces.is_empty()).then_some(0));
     app.selected = app.active.unwrap_or(0);
     app.workspace_scroll = crate::ui::normalized_workspace_scroll(&app, app.view.sidebar_rect, 0);
-    app.view.workspace_card_areas =
-        crate::ui::compute_workspace_card_areas(&app, app.view.sidebar_rect);
+    app.view.workspace_card_areas = if app.sidebar_collapsed {
+        Vec::new()
+    } else {
+        crate::ui::compute_workspace_card_areas(&app, app.view.sidebar_rect)
+    };
 
     (app, workspace_routes, agent_routes)
 }
@@ -1180,27 +1193,29 @@ fn patch_metadata_tokens(
 }
 
 fn compose_frame(
-    sidebar: FrameData,
     content: Option<&FrameData>,
     width: u16,
     height: u16,
     sidebar_width: u16,
 ) -> FrameData {
-    let blank = sidebar.cells.first().cloned().unwrap_or(CellData {
-        symbol: " ".to_string(),
-        fg: 0,
-        bg: 0,
-        modifier: 0,
-        skip: false,
-        hyperlink: None,
-    });
+    let blank = content
+        .and_then(|frame| frame.cells.first())
+        .cloned()
+        .map(|mut cell| {
+            cell.symbol = " ".to_string();
+            cell.skip = false;
+            cell.hyperlink = None;
+            cell
+        })
+        .unwrap_or(CellData {
+            symbol: " ".to_string(),
+            fg: 0,
+            bg: 0,
+            modifier: 0,
+            skip: false,
+            hyperlink: None,
+        });
     let mut cells = vec![blank; width as usize * height as usize];
-    for row in 0..height.min(sidebar.height) {
-        for col in 0..sidebar_width.min(sidebar.width) {
-            cells[row as usize * width as usize + col as usize] =
-                sidebar.cells[row as usize * sidebar.width as usize + col as usize].clone();
-        }
-    }
 
     let mut cursor = None;
     let mut hyperlinks = Vec::new();
@@ -1225,6 +1240,50 @@ fn compose_frame(
         height,
         cursor,
         hyperlinks,
-        graphics: Vec::new(),
+        graphics: content
+            .map(|frame| shift_graphics_columns(&frame.graphics, sidebar_width))
+            .unwrap_or_default(),
     }
+}
+
+/// Kitty image placements use absolute cursor coordinates. Content-surface
+/// servers encode those coordinates relative to column zero, so shift each
+/// cursor-position command past the aggregate sidebar before blitting it.
+fn shift_graphics_columns(graphics: &[u8], offset: u16) -> Vec<u8> {
+    if graphics.is_empty() || offset == 0 {
+        return graphics.to_vec();
+    }
+    let mut shifted = Vec::with_capacity(graphics.len());
+    let mut cursor = 0usize;
+    while cursor < graphics.len() {
+        if graphics.get(cursor..cursor.saturating_add(2)) == Some(b"\x1b[") {
+            let sequence_start = cursor;
+            let mut index = cursor + 2;
+            let row_start = index;
+            while graphics.get(index).is_some_and(u8::is_ascii_digit) {
+                index += 1;
+            }
+            if index > row_start && graphics.get(index) == Some(&b';') {
+                index += 1;
+                let column_start = index;
+                while graphics.get(index).is_some_and(u8::is_ascii_digit) {
+                    index += 1;
+                }
+                if index > column_start && graphics.get(index) == Some(&b'H') {
+                    shifted.extend_from_slice(&graphics[sequence_start..column_start]);
+                    let column = std::str::from_utf8(&graphics[column_start..index])
+                        .ok()
+                        .and_then(|value| value.parse::<u16>().ok())
+                        .unwrap_or(1);
+                    shifted.extend_from_slice(column.saturating_add(offset).to_string().as_bytes());
+                    shifted.push(b'H');
+                    cursor = index + 1;
+                    continue;
+                }
+            }
+        }
+        shifted.push(graphics[cursor]);
+        cursor += 1;
+    }
+    shifted
 }
