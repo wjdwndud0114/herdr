@@ -75,6 +75,7 @@ struct FleetState {
 }
 
 struct FleetVisualConfig {
+    sidebar_width: u16,
     palette: crate::app::state::Palette,
     theme_name: String,
     theme_runtime: crate::app::state::ThemeRuntimeConfig,
@@ -87,49 +88,58 @@ struct FleetVisualConfig {
     sidebar_start_collapsed: bool,
     sidebar_collapsed_mode: crate::config::SidebarCollapsedModeConfig,
     confirm_close: bool,
+    show_agent_labels_on_pane_borders: bool,
+    sound: crate::config::SoundConfig,
+    toast: crate::config::ToastConfig,
     keybinds: crate::config::Keybinds,
     prefix_code: crossterm::event::KeyCode,
     prefix_mods: crossterm::event::KeyModifiers,
     mouse_capture: bool,
 }
 
+fn fleet_visual_config(config: &crate::config::Config) -> FleetVisualConfig {
+    let theme_runtime = crate::app::theme_runtime_config(config, true);
+    let (palette, theme_name) = crate::app::resolve_effective_theme(&theme_runtime, None);
+    let (prefix_code, prefix_mods) = config.prefix_key();
+    let (sidebar_min_width, sidebar_max_width) = crate::config::validated_sidebar_bounds(
+        config.ui.sidebar_min_width,
+        config.ui.sidebar_max_width,
+    )
+    .unwrap_or((18, 36));
+    FleetVisualConfig {
+        sidebar_width: config
+            .ui
+            .sidebar_width
+            .clamp(sidebar_min_width, sidebar_max_width),
+        palette,
+        theme_name,
+        theme_runtime,
+        status_indicators: config.ui.status_indicators,
+        agent_panel_sort: crate::app::agent_panel_sort_from_config(config.ui.agent_panel_sort),
+        sidebar_agents: config.ui.sidebar.agents.clone(),
+        sidebar_spaces: config.ui.sidebar.spaces.clone(),
+        sidebar_min_width,
+        sidebar_max_width,
+        sidebar_start_collapsed: config.ui.sidebar_start_collapsed,
+        sidebar_collapsed_mode: config.ui.sidebar_collapsed_mode,
+        confirm_close: config.ui.confirm_close,
+        show_agent_labels_on_pane_borders: config.ui.show_agent_labels_on_pane_borders,
+        sound: config.ui.sound.clone(),
+        toast: config.ui.toast.clone(),
+        keybinds: config.keybinds(),
+        prefix_code,
+        prefix_mods,
+        mouse_capture: config.ui.mouse_capture,
+    }
+}
+
 pub(super) fn run() -> io::Result<()> {
     super::init_logging();
     let loaded = crate::config::Config::load();
     crate::terminal_modes::clear_host_mouse_reporting(&mut io::stdout())?;
-    let mouse_capture = loaded.config.ui.mouse_capture;
-    let sidebar_width = loaded.config.ui.sidebar_width.clamp(
-        loaded.config.ui.sidebar_min_width,
-        loaded.config.ui.sidebar_max_width,
-    );
-    let theme_runtime = crate::app::theme_runtime_config(&loaded.config, true);
-    let (palette, theme_name) = crate::app::resolve_effective_theme(&theme_runtime, None);
-    let (prefix_code, prefix_mods) = loaded.config.prefix_key();
-    let (sidebar_min_width, sidebar_max_width) = crate::config::validated_sidebar_bounds(
-        loaded.config.ui.sidebar_min_width,
-        loaded.config.ui.sidebar_max_width,
-    )
-    .unwrap_or((18, 36));
-    let visual = FleetVisualConfig {
-        palette,
-        theme_name,
-        theme_runtime,
-        status_indicators: loaded.config.ui.status_indicators,
-        agent_panel_sort: crate::app::agent_panel_sort_from_config(
-            loaded.config.ui.agent_panel_sort,
-        ),
-        sidebar_agents: loaded.config.ui.sidebar.agents.clone(),
-        sidebar_spaces: loaded.config.ui.sidebar.spaces.clone(),
-        sidebar_min_width,
-        sidebar_max_width,
-        sidebar_start_collapsed: loaded.config.ui.sidebar_start_collapsed,
-        sidebar_collapsed_mode: loaded.config.ui.sidebar_collapsed_mode,
-        confirm_close: loaded.config.ui.confirm_close,
-        keybinds: loaded.config.keybinds(),
-        prefix_code,
-        prefix_mods,
-        mouse_capture,
-    };
+    let visual = fleet_visual_config(&loaded.config);
+    let mouse_capture = visual.mouse_capture;
+    let sidebar_width = visual.sidebar_width;
     let (cols, rows, _, _) = super::initial_terminal_geometry(false);
     let initial_sidebar_width = if visual.sidebar_start_collapsed {
         match visual.sidebar_collapsed_mode {
@@ -207,7 +217,7 @@ pub(super) fn run() -> io::Result<()> {
         sidebar_width,
         mouse_capture,
         should_quit,
-        loaded.config.ui.sound,
+        visual.sound.clone(),
         visual,
     ));
 
@@ -697,6 +707,73 @@ fn mouse_button(button: MouseButton) -> ClientMouseButton {
     }
 }
 
+fn update_fleet_config_file<F>(state: &mut FleetState, error_context: &str, update: F) -> bool
+where
+    F: FnOnce(&str) -> String,
+{
+    let path = crate::config::config_path();
+    if let Some(parent) = path.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            tracing::warn!(path = %path.display(), error_context, err = %err, "fleet config write failed");
+            state.sidebar.config_diagnostic =
+                Some(format!("failed to save {error_context}: {err}"));
+            return false;
+        }
+    }
+
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    if let Err(err) = std::fs::write(&path, update(&content)) {
+        tracing::warn!(path = %path.display(), error_context, err = %err, "fleet config write failed");
+        state.sidebar.config_diagnostic = Some(format!("failed to save {error_context}: {err}"));
+        return false;
+    }
+
+    reload_fleet_visual_config(state);
+    true
+}
+
+fn install_recommended_fleet_integrations(state: &mut FleetState) {
+    let targets = state
+        .sidebar
+        .integration_recommendations
+        .iter()
+        .filter(|recommendation| recommendation.needs_install())
+        .map(|recommendation| recommendation.target)
+        .collect::<Vec<_>>();
+
+    state.sidebar.integration_install_messages.clear();
+    if targets.is_empty() {
+        state
+            .sidebar
+            .integration_install_messages
+            .push("all detected integrations are current".to_string());
+        return;
+    }
+
+    for target in targets {
+        let label = crate::integration::integration_target_label(target);
+        match crate::integration::install_target(target) {
+            Ok(messages) => {
+                state
+                    .sidebar
+                    .integration_install_messages
+                    .push(format!("installed {label}"));
+                state
+                    .sidebar
+                    .integration_install_messages
+                    .extend(messages.into_iter().filter(|message| {
+                        message.starts_with(crate::integration::INSTALL_WARNING_PREFIX)
+                    }));
+            }
+            Err(err) => state
+                .sidebar
+                .integration_install_messages
+                .push(format!("{label}: {err}")),
+        }
+    }
+    state.sidebar.integration_recommendations = crate::integration::integration_recommendations();
+}
+
 fn dispatch_sidebar_action(state: &mut FleetState, action: crate::app::ClientSidebarAction) {
     match action {
         crate::app::ClientSidebarAction::Redraw => {}
@@ -768,7 +845,78 @@ fn dispatch_sidebar_action(state: &mut FleetState, action: crate::app::ClientSid
                 );
             }
         }
+        crate::app::ClientSidebarAction::SaveTheme { name } => {
+            update_fleet_config_file(state, "theme", |content| {
+                let content = crate::config::upsert_section_value(
+                    content,
+                    "theme",
+                    "name",
+                    &format!("\"{name}\""),
+                );
+                crate::config::upsert_section_bool(&content, "theme", "auto_switch", false)
+            });
+        }
+        crate::app::ClientSidebarAction::SaveStatusIndicators { style } => {
+            update_fleet_config_file(state, "status indicators", |content| {
+                crate::config::upsert_section_value(
+                    content,
+                    "ui",
+                    "status_indicators",
+                    &format!("\"{}\"", style.as_str()),
+                )
+            });
+        }
+        crate::app::ClientSidebarAction::SaveSound { enabled } => {
+            update_fleet_config_file(state, "sound setting", |content| {
+                crate::config::upsert_section_bool(content, "ui.sound", "enabled", enabled)
+            });
+        }
+        crate::app::ClientSidebarAction::SaveToastDelivery { delivery } => {
+            let value = match delivery {
+                crate::config::ToastDelivery::Off => "\"off\"",
+                crate::config::ToastDelivery::Herdr => "\"herdr\"",
+                crate::config::ToastDelivery::Terminal => "\"terminal\"",
+                crate::config::ToastDelivery::System => "\"system\"",
+            };
+            update_fleet_config_file(state, "toast setting", |content| {
+                let content =
+                    crate::config::upsert_section_value(content, "ui.toast", "delivery", value);
+                crate::config::remove_section_key(&content, "ui.toast", "enabled")
+            });
+        }
+        crate::app::ClientSidebarAction::SaveAgentBorderLabels { enabled } => {
+            update_fleet_config_file(state, "agent border labels", |content| {
+                crate::config::upsert_section_bool(
+                    content,
+                    "ui",
+                    "show_agent_labels_on_pane_borders",
+                    enabled,
+                )
+            });
+        }
+        crate::app::ClientSidebarAction::InstallRecommendedIntegrations => {
+            install_recommended_fleet_integrations(state);
+        }
+        crate::app::ClientSidebarAction::SaveAgentPanelSort { sort } => {
+            let value = match sort {
+                crate::app::state::AgentPanelSort::Spaces => {
+                    crate::config::AgentPanelSortConfig::Spaces.as_str()
+                }
+                crate::app::state::AgentPanelSort::Priority => {
+                    crate::config::AgentPanelSortConfig::Priority.as_str()
+                }
+            };
+            update_fleet_config_file(state, "agent panel sort", |content| {
+                crate::config::upsert_section_value(
+                    content,
+                    "ui",
+                    "agent_panel_sort",
+                    &format!("\"{value}\""),
+                )
+            });
+        }
         crate::app::ClientSidebarAction::ReloadConfig => {
+            reload_fleet_visual_config(state);
             for index in 0..state.instances.len() {
                 request_for_instance(
                     state,
@@ -906,6 +1054,9 @@ fn configure_sidebar_state(
     app.sidebar_spaces = visual.sidebar_spaces.clone();
     app.mouse_capture = visual.mouse_capture;
     app.confirm_close = visual.confirm_close;
+    app.show_agent_labels_on_pane_borders = visual.show_agent_labels_on_pane_borders;
+    app.sound = visual.sound.clone();
+    app.toast_config = visual.toast.clone();
     app.keybinds = visual.keybinds.clone();
     app.prefix_code = visual.prefix_code;
     app.prefix_mods = visual.prefix_mods;
@@ -917,6 +1068,40 @@ fn configure_sidebar_state(
     let sidebar_width = current_app_sidebar_width(app, cols);
     app.view.sidebar_rect = Rect::new(0, 0, sidebar_width, rows);
     app.view.terminal_area = Rect::new(sidebar_width, 0, cols.saturating_sub(sidebar_width), rows);
+}
+
+fn apply_fleet_visual_config(state: &mut FleetState, visual: FleetVisualConfig) {
+    state.sound_config = visual.sound.clone();
+    let app = &mut state.sidebar;
+    app.default_sidebar_width = visual.sidebar_width;
+    app.sidebar_min_width = visual.sidebar_min_width;
+    app.sidebar_max_width = visual.sidebar_max_width;
+    app.sidebar_width = app
+        .sidebar_width
+        .clamp(app.sidebar_min_width, app.sidebar_max_width);
+    app.sidebar_collapsed_mode = visual.sidebar_collapsed_mode;
+    app.status_indicators = visual.status_indicators;
+    app.agent_panel_sort = visual.agent_panel_sort;
+    app.sidebar_agents = visual.sidebar_agents.clone();
+    app.sidebar_spaces = visual.sidebar_spaces.clone();
+    app.mouse_capture = visual.mouse_capture;
+    app.confirm_close = visual.confirm_close;
+    app.show_agent_labels_on_pane_borders = visual.show_agent_labels_on_pane_borders;
+    app.sound = visual.sound.clone();
+    app.toast_config = visual.toast.clone();
+    app.keybinds = visual.keybinds.clone();
+    app.prefix_code = visual.prefix_code;
+    app.prefix_mods = visual.prefix_mods;
+    app.palette = visual.palette.clone();
+    app.theme_name = visual.theme_name.clone();
+    app.theme_runtime = visual.theme_runtime.clone();
+    state.visual = visual;
+}
+
+fn reload_fleet_visual_config(state: &mut FleetState) {
+    let loaded = crate::config::Config::load();
+    state.sidebar.config_diagnostic = crate::config::config_diagnostic_summary(&loaded.diagnostics);
+    apply_fleet_visual_config(state, fleet_visual_config(&loaded.config));
 }
 
 fn sync_sidebar_model(state: &mut FleetState, cols: u16, rows: u16) {
