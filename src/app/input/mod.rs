@@ -70,6 +70,320 @@ use self::{
 use super::state::{AppState, Mode};
 use super::App;
 
+#[derive(Debug)]
+pub(crate) enum ClientSidebarAction {
+    Redraw,
+    NewWorkspace,
+    FocusWorkspace {
+        ws_idx: usize,
+    },
+    FocusPane {
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    },
+    RenameStarted {
+        ws_idx: usize,
+    },
+    RenameWorkspace {
+        ws_idx: usize,
+        label: String,
+    },
+    CloseWorkspace {
+        ws_idx: usize,
+    },
+    ReloadConfig,
+    Detach,
+}
+
+pub(crate) enum ClientSidebarInput {
+    Forward,
+    Consumed(Option<ClientSidebarAction>),
+}
+
+fn take_client_sidebar_request(state: &mut AppState) -> Option<ClientSidebarAction> {
+    if state.detach_requested {
+        state.detach_requested = false;
+        return Some(ClientSidebarAction::Detach);
+    }
+    if state.request_reload_config {
+        state.request_reload_config = false;
+        return Some(ClientSidebarAction::ReloadConfig);
+    }
+    None
+}
+
+fn finish_client_sidebar_rename(state: &mut AppState) -> Option<ClientSidebarAction> {
+    let label = state.name_input.trim().to_string();
+    let ws_idx = state.selected;
+    state.name_input.clear();
+    state.name_input_replace_on_type = false;
+    modal::leave_modal(state);
+    (!label.is_empty()).then_some(ClientSidebarAction::RenameWorkspace { ws_idx, label })
+}
+
+fn apply_client_sidebar_rename_action(
+    state: &mut AppState,
+    action: ModalAction,
+) -> Option<ClientSidebarAction> {
+    match action {
+        ModalAction::Save => finish_client_sidebar_rename(state),
+        ModalAction::Clear => {
+            state.name_input.clear();
+            state.name_input_replace_on_type = false;
+            None
+        }
+        ModalAction::Cancel => {
+            state.name_input.clear();
+            state.name_input_replace_on_type = false;
+            modal::leave_modal(state);
+            None
+        }
+        _ => None,
+    }
+}
+
+fn apply_client_sidebar_context_action(
+    state: &mut AppState,
+    menu: crate::app::state::ContextMenuState,
+    idx: usize,
+) -> Option<ClientSidebarAction> {
+    let item = menu.items().get(idx).copied();
+    match (menu.kind, item) {
+        (
+            crate::app::state::ContextMenuKind::Workspace { ws_idx }
+            | crate::app::state::ContextMenuKind::GitWorkspace { ws_idx, .. },
+            Some("Rename"),
+        ) => {
+            let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+            modal::open_rename_workspace(state, &runtimes, ws_idx);
+            Some(ClientSidebarAction::RenameStarted { ws_idx })
+        }
+        (
+            crate::app::state::ContextMenuKind::Workspace { ws_idx }
+            | crate::app::state::ContextMenuKind::GitWorkspace { ws_idx, .. },
+            Some("Close" | "Close group"),
+        ) => {
+            state.selected = ws_idx;
+            if state.confirm_close {
+                modal::open_confirm_close(state);
+                None
+            } else {
+                modal::leave_modal(state);
+                Some(ClientSidebarAction::CloseWorkspace { ws_idx })
+            }
+        }
+        _ => {
+            modal::leave_modal(state);
+            None
+        }
+    }
+}
+
+pub(crate) fn handle_client_sidebar_mouse(
+    state: &mut AppState,
+    mouse: MouseEvent,
+) -> Option<ClientSidebarAction> {
+    let mut runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+    let action = state.handle_mouse(&mut runtimes, mouse);
+    let action = match action {
+        Some(MouseAction::NewWorkspace) => Some(ClientSidebarAction::NewWorkspace),
+        Some(MouseAction::FocusWorkspace { ws_idx }) => {
+            Some(ClientSidebarAction::FocusWorkspace { ws_idx })
+        }
+        Some(MouseAction::FocusPane { ws_idx, pane_id }) => {
+            Some(ClientSidebarAction::FocusPane { ws_idx, pane_id })
+        }
+        Some(MouseAction::RenameModal(action)) => apply_client_sidebar_rename_action(state, action),
+        Some(MouseAction::ConfirmCloseAccept) => {
+            let ws_idx = state.selected;
+            state.mode = Mode::Terminal;
+            Some(ClientSidebarAction::CloseWorkspace { ws_idx })
+        }
+        Some(MouseAction::ContextMenu { menu, idx }) => {
+            apply_client_sidebar_context_action(state, menu, idx)
+        }
+        _ => None,
+    };
+    take_client_sidebar_request(state).or(action)
+}
+
+fn begin_client_sidebar_rename(state: &mut AppState) -> Option<ClientSidebarAction> {
+    let ws_idx = state.active.unwrap_or(state.selected);
+    if ws_idx >= state.workspaces.len() {
+        return None;
+    }
+    let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+    modal::open_rename_workspace(state, &runtimes, ws_idx);
+    Some(ClientSidebarAction::RenameStarted { ws_idx })
+}
+
+fn close_client_sidebar_workspace(state: &mut AppState) -> Option<ClientSidebarAction> {
+    let ws_idx = state.active.unwrap_or(state.selected);
+    if ws_idx >= state.workspaces.len() {
+        return None;
+    }
+    state.selected = ws_idx;
+    if state.confirm_close {
+        modal::open_confirm_close(state);
+        None
+    } else {
+        state.mode = Mode::Terminal;
+        Some(ClientSidebarAction::CloseWorkspace { ws_idx })
+    }
+}
+
+fn handle_client_sidebar_action_key(
+    state: &mut AppState,
+    key: &TerminalKey,
+    prefix: bool,
+) -> Option<ClientSidebarAction> {
+    let matches = |binding: &crate::config::ActionKeybinds| {
+        if prefix {
+            binding.matches_prefix_key(key)
+        } else {
+            binding.matches_direct_key(key)
+        }
+    };
+
+    if matches(&state.keybinds.detach) {
+        return Some(ClientSidebarAction::Detach);
+    }
+    if matches(&state.keybinds.reload_config) {
+        return Some(ClientSidebarAction::ReloadConfig);
+    }
+    if matches(&state.keybinds.new_workspace) {
+        return Some(ClientSidebarAction::NewWorkspace);
+    }
+    if matches(&state.keybinds.rename_workspace) {
+        return begin_client_sidebar_rename(state);
+    }
+    if matches(&state.keybinds.close_workspace) {
+        return close_client_sidebar_workspace(state);
+    }
+    if matches(&state.keybinds.toggle_sidebar) {
+        state.sidebar_collapsed = !state.sidebar_collapsed;
+        return Some(ClientSidebarAction::Redraw);
+    }
+    if matches(&state.keybinds.help) {
+        modal::open_keybind_help(state);
+        return None;
+    }
+    if matches(&state.keybinds.settings) {
+        settings::open_settings(state);
+        return None;
+    }
+    None
+}
+
+pub(crate) fn handle_client_sidebar_key(
+    state: &mut AppState,
+    key: TerminalKey,
+) -> ClientSidebarInput {
+    let key_event = key.as_key_event();
+    let action = match state.mode {
+        Mode::RenameWorkspace => {
+            if let Some(action) = modal::modal_action_from_key(&key_event, modal::RENAME_ACTIONS) {
+                apply_client_sidebar_rename_action(state, action)
+            } else {
+                modal::handle_rename_edit_key(state, key_event);
+                None
+            }
+        }
+        Mode::ContextMenu => match key_event.code {
+            KeyCode::Esc => {
+                state.context_menu = None;
+                modal::leave_modal(state);
+                None
+            }
+            KeyCode::Up => {
+                if let Some(menu) = &mut state.context_menu {
+                    menu.list.move_prev();
+                }
+                None
+            }
+            KeyCode::Down => {
+                if let Some(menu) = &mut state.context_menu {
+                    menu.list.move_next(menu.items().len());
+                }
+                None
+            }
+            KeyCode::Enter => state.context_menu.take().and_then(|menu| {
+                let idx = menu.list.highlighted;
+                apply_client_sidebar_context_action(state, menu, idx)
+            }),
+            _ => None,
+        },
+        Mode::GlobalMenu => {
+            modal::handle_global_menu_key(state, key_event);
+            None
+        }
+        Mode::KeybindHelp => {
+            modal::handle_keybind_help_key(state, key);
+            None
+        }
+        Mode::ConfirmClose => match key_event.code {
+            KeyCode::Enter => {
+                let ws_idx = state.selected;
+                state.mode = Mode::Terminal;
+                Some(ClientSidebarAction::CloseWorkspace { ws_idx })
+            }
+            KeyCode::Esc => {
+                modal::confirm_close_cancel(state);
+                None
+            }
+            _ => None,
+        },
+        Mode::Settings => {
+            if key_event.code == KeyCode::Esc {
+                modal::leave_modal(state);
+            }
+            None
+        }
+        Mode::Prefix => {
+            let action = handle_client_sidebar_action_key(state, &key, true);
+            if state.mode == Mode::Prefix {
+                state.mode = Mode::Terminal;
+            }
+            action
+        }
+        Mode::Terminal => {
+            let normalized = crate::config::normalize_key_combo((key.code, key.modifiers));
+            let prefix = crate::config::normalize_key_combo((state.prefix_code, state.prefix_mods));
+            if normalized == prefix {
+                state.mode = Mode::Prefix;
+                return ClientSidebarInput::Consumed(None);
+            }
+            let action = handle_client_sidebar_action_key(state, &key, false);
+            if action.is_none() && state.mode == Mode::Terminal {
+                return ClientSidebarInput::Forward;
+            }
+            action
+        }
+        _ => {
+            if key_event.code == KeyCode::Esc {
+                modal::leave_modal(state);
+            }
+            None
+        }
+    };
+    ClientSidebarInput::Consumed(take_client_sidebar_request(state).or(action))
+}
+
+pub(crate) fn handle_client_sidebar_text(state: &mut AppState, text: &str) -> bool {
+    match state.mode {
+        Mode::RenameWorkspace => {
+            modal::insert_rename_input_text(state, text);
+            true
+        }
+        Mode::KeybindHelp => {
+            modal::insert_keybind_help_query_text(state, text);
+            true
+        }
+        Mode::Terminal => false,
+        _ => true,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Key handling
 // ---------------------------------------------------------------------------

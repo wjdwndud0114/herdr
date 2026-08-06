@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use interprocess::local_socket::traits::Listener as _;
-#[cfg(windows)]
 use interprocess::local_socket::traits::Stream as _;
 use interprocess::local_socket::ListenerNonblockingMode;
 use interprocess::TryClone as _;
@@ -1923,9 +1922,14 @@ fn bridge_connection(
     remote_herdr: &RemoteHerdr,
     session_name: &str,
     ssh_options: Option<&ManagedSshOptions>,
-    _bridge_stop: &Arc<AtomicBool>,
+    bridge_stop: &Arc<AtomicBool>,
     endpoint: RemoteBridgeEndpoint,
 ) -> io::Result<()> {
+    // Accepted Unix-domain streams may inherit the listener's nonblocking
+    // mode. These bridge workers use blocking copies, and a large initial
+    // semantic frame can otherwise turn a transient WouldBlock into a dropped
+    // SSH connection.
+    stream.set_nonblocking(false)?;
     let mut command = Command::new("ssh");
     apply_managed_ssh_options(&mut command, ssh_options);
     command
@@ -1962,11 +1966,20 @@ fn bridge_connection(
         let _ = crate::ipc::shutdown_local_stream_write(&child_to_stream);
     });
 
-    let status = child.wait()?;
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None if bridge_stop.load(Ordering::Acquire) => {
+                let _ = child.kill();
+                break child.wait()?;
+            }
+            None => thread::sleep(BRIDGE_ACCEPT_POLL),
+        }
+    };
     let _ = upload.join();
     let _ = download.join();
 
-    if status.success() {
+    if status.success() || bridge_stop.load(Ordering::Acquire) {
         Ok(())
     } else {
         Err(io::Error::new(

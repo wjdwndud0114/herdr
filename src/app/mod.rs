@@ -16,6 +16,10 @@ mod creation;
 mod git_refresh;
 mod ids;
 mod input;
+pub(crate) use input::{
+    handle_client_sidebar_key, handle_client_sidebar_mouse, handle_client_sidebar_text,
+    ClientSidebarAction, ClientSidebarInput,
+};
 mod popup;
 mod runtime;
 mod runtime_mutations;
