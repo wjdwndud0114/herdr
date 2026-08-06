@@ -1957,6 +1957,7 @@ fn bridge_connection(
         .take()
         .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "ssh bridge stdout missing"))?;
     let mut stream_to_child = stream.try_clone()?;
+    let shutdown_stream = stream.try_clone()?;
     let mut child_to_stream = stream;
 
     let upload = thread::spawn(move || {
@@ -1977,6 +1978,10 @@ fn bridge_connection(
             None => thread::sleep(BRIDGE_ACCEPT_POLL),
         }
     };
+    // Killing ssh closes its stdio, but the upload worker can still be blocked
+    // reading the local socket while the client owns another stream clone.
+    // Close both directions before joining so bridge teardown cannot hang.
+    let _ = crate::ipc::shutdown_local_stream(&shutdown_stream);
     let _ = upload.join();
     let _ = download.join();
 
