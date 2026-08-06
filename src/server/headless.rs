@@ -1043,21 +1043,29 @@ impl HeadlessServer {
         let Some(client) = self.clients.get(&client_id) else {
             return;
         };
+        let cell_size = client.cell_size;
+        let app_surface = client.app_surface;
         let (cols, rows) = self.effective_size;
         let area = Rect::new(0, 0, cols, rows);
-        if self.app.state.kitty_graphics_enabled && client.cell_size.is_known() {
-            crate::ui::compute_view_with_cell_size(
-                &mut self.app.state,
-                &self.app.terminal_runtimes,
-                area,
-                client.cell_size,
-            );
+        let cell_size = if self.app.state.kitty_graphics_enabled && cell_size.is_known() {
+            cell_size
         } else {
-            crate::ui::compute_view_with_runtime_registry(
+            crate::kitty_graphics::HostCellSize::default()
+        };
+        match app_surface {
+            crate::protocol::AppSurface::Full => crate::ui::compute_view_with_cell_size(
                 &mut self.app.state,
                 &self.app.terminal_runtimes,
                 area,
-            );
+                cell_size,
+            ),
+            crate::protocol::AppSurface::Content => crate::ui::compute_content_view_with_cell_size(
+                &mut self.app.state,
+                &self.app.terminal_runtimes,
+                area,
+                true,
+                cell_size,
+            ),
         }
 
         // Shared runtime size changes affect pane wrapping and foreground-driven
