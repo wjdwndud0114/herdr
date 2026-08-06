@@ -181,7 +181,7 @@ fn connect_app(path: &PathBuf, cols: u16, rows: u16) -> Result<LocalStream, Clie
 }
 
 async fn run_loop(
-    mut instances: Vec<Instance>,
+    instances: Vec<Instance>,
     cols: u16,
     rows: u16,
     sidebar_width: u16,
