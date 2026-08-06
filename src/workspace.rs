@@ -199,6 +199,15 @@ pub struct Workspace {
     pub(crate) test_runtimes: HashMap<PaneId, TerminalRuntime>,
 }
 
+/// Runtime-free tab data used by client-owned shells that project server snapshots through the
+/// normal workspace, sidebar, and navigator renderers.
+pub(crate) struct SidebarPlaceholderTab {
+    pub(crate) label: Option<String>,
+    pub(crate) number: usize,
+    pub(crate) pane_terminals: Vec<(TerminalId, bool)>,
+    pub(crate) focused_pane_idx: Option<usize>,
+}
+
 impl Deref for Workspace {
     type Target = Tab;
 
@@ -224,54 +233,99 @@ impl Workspace {
         pane_terminals: Vec<(TerminalId, bool)>,
         focused_pane_idx: Option<usize>,
     ) -> (Self, Vec<PaneId>) {
+        let (workspace, mut tab_pane_ids) = Self::sidebar_placeholder_with_tabs(
+            id,
+            name,
+            branch,
+            vec![SidebarPlaceholderTab {
+                label: None,
+                number: 1,
+                pane_terminals,
+                focused_pane_idx,
+            }],
+            0,
+        );
+        (workspace, tab_pane_ids.pop().unwrap_or_default())
+    }
+
+    pub(crate) fn sidebar_placeholder_with_tabs(
+        id: String,
+        name: String,
+        branch: Option<String>,
+        mut placeholder_tabs: Vec<SidebarPlaceholderTab>,
+        active_tab: usize,
+    ) -> (Self, Vec<Vec<PaneId>>) {
         let (events, _) = mpsc::channel(64);
         let render_notify = Arc::new(Notify::new());
         let render_dirty = Arc::new(RenderSignal::new());
         let identity_cwd = PathBuf::from("/");
-        let mut pane_terminals = pane_terminals;
-        if pane_terminals.is_empty() {
-            pane_terminals.push((TerminalId::alloc(), true));
+        if placeholder_tabs.is_empty() {
+            placeholder_tabs.push(SidebarPlaceholderTab {
+                label: None,
+                number: 1,
+                pane_terminals: Vec::new(),
+                focused_pane_idx: None,
+            });
         }
 
-        let (mut layout, root_id) = TileLayout::new();
-        let mut panes = HashMap::new();
-        let mut pane_ids = vec![root_id];
         let mut public_pane_numbers = HashMap::new();
+        let mut next_public_pane_number = 1;
+        let mut next_public_tab_number = 1;
+        let mut tabs = Vec::with_capacity(placeholder_tabs.len());
+        let mut tab_pane_ids = Vec::with_capacity(placeholder_tabs.len());
 
-        let (root_terminal_id, root_seen) = pane_terminals[0].clone();
-        let mut root_pane = PaneState::new(root_terminal_id);
-        root_pane.seen = root_seen;
-        panes.insert(root_id, root_pane);
-        public_pane_numbers.insert(root_id, 1);
+        for mut placeholder in placeholder_tabs {
+            if placeholder.pane_terminals.is_empty() {
+                placeholder.pane_terminals.push((TerminalId::alloc(), true));
+            }
+            let (mut layout, root_id) = TileLayout::new();
+            let mut panes = HashMap::new();
+            let mut pane_ids = vec![root_id];
 
-        for (idx, (terminal_id, seen)) in pane_terminals.into_iter().enumerate().skip(1) {
-            let Some(pane_id) = layout.split_pane(root_id, Direction::Vertical, 0.5) else {
-                continue;
-            };
-            let mut pane = PaneState::new(terminal_id);
-            pane.seen = seen;
-            panes.insert(pane_id, pane);
-            pane_ids.push(pane_id);
-            public_pane_numbers.insert(pane_id, idx + 1);
+            let (root_terminal_id, root_seen) = placeholder.pane_terminals[0].clone();
+            let mut root_pane = PaneState::new(root_terminal_id);
+            root_pane.seen = root_seen;
+            panes.insert(root_id, root_pane);
+            public_pane_numbers.insert(root_id, next_public_pane_number);
+            next_public_pane_number += 1;
+
+            for (terminal_id, seen) in placeholder.pane_terminals.into_iter().skip(1) {
+                let Some(pane_id) = layout.split_pane(root_id, Direction::Vertical, 0.5) else {
+                    continue;
+                };
+                let mut pane = PaneState::new(terminal_id);
+                pane.seen = seen;
+                panes.insert(pane_id, pane);
+                pane_ids.push(pane_id);
+                public_pane_numbers.insert(pane_id, next_public_pane_number);
+                next_public_pane_number += 1;
+            }
+
+            if let Some(focused_pane) = placeholder
+                .focused_pane_idx
+                .and_then(|idx| pane_ids.get(idx).copied())
+            {
+                layout.focus_pane(focused_pane);
+            }
+
+            next_public_tab_number = next_public_tab_number.max(placeholder.number + 1);
+            tabs.push(Tab {
+                custom_name: placeholder.label,
+                number: placeholder.number,
+                root_pane: root_id,
+                layout,
+                panes,
+                #[cfg(test)]
+                runtimes: HashMap::new(),
+                zoomed: false,
+                events: events.clone(),
+                render_notify: render_notify.clone(),
+                render_dirty: render_dirty.clone(),
+            });
+            tab_pane_ids.push(pane_ids);
         }
 
-        if let Some(focused_pane) = focused_pane_idx.and_then(|idx| pane_ids.get(idx).copied()) {
-            layout.focus_pane(focused_pane);
-        }
-
-        let tab = Tab {
-            custom_name: None,
-            number: 1,
-            root_pane: root_id,
-            layout,
-            panes,
-            #[cfg(test)]
-            runtimes: HashMap::new(),
-            zoomed: false,
-            events,
-            render_notify,
-            render_dirty,
-        };
+        let active_tab = active_tab.min(tabs.len().saturating_sub(1));
 
         (
             Self {
@@ -288,14 +342,14 @@ impl Workspace {
                 metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
                 metadata_token_sequences: HashMap::new(),
                 public_pane_numbers,
-                next_public_pane_number: pane_ids.len() + 1,
-                next_public_tab_number: 2,
-                tabs: vec![tab],
-                active_tab: 0,
+                next_public_pane_number,
+                next_public_tab_number,
+                tabs,
+                active_tab,
                 #[cfg(test)]
                 test_runtimes: HashMap::new(),
             },
-            pane_ids,
+            tab_pane_ids,
         )
     }
 

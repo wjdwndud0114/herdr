@@ -14,8 +14,8 @@ use ratatui::layout::Rect;
 use super::{ClientError, ClientLoopEvent};
 use crate::api::client::{ApiClient, ConnectionTarget};
 use crate::api::schema::{
-    AgentStatus, AgentTarget, EmptyParams, Method, Request, ResponseResult, SessionSnapshot,
-    WorkspaceCreateParams, WorkspaceRenameParams, WorkspaceTarget,
+    AgentStatus, EmptyParams, Method, PaneTarget, Request, ResponseResult, SessionSnapshot,
+    TabTarget, WorkspaceCreateParams, WorkspaceRenameParams, WorkspaceTarget,
 };
 use crate::ipc::LocalStream;
 use crate::protocol::{
@@ -58,7 +58,8 @@ enum FleetEvent {
 enum SidebarHit {
     Instance { index: usize },
     Workspace { index: usize, workspace_id: String },
-    Agent { index: usize, target: String },
+    Tab { index: usize, tab_id: String },
+    Pane { index: usize, pane_id: String },
 }
 
 struct FleetState {
@@ -66,7 +67,8 @@ struct FleetState {
     active: usize,
     sidebar: crate::app::AppState,
     workspace_routes: HashMap<usize, SidebarHit>,
-    agent_routes: HashMap<(usize, crate::layout::PaneId), SidebarHit>,
+    tab_routes: HashMap<(usize, usize), SidebarHit>,
+    pane_routes: HashMap<(usize, crate::layout::PaneId), SidebarHit>,
     blit_encoder: crate::protocol::render_ansi::BlitEncoder,
     repaint_pending: bool,
     quit_requested: bool,
@@ -314,7 +316,8 @@ async fn run_loop(
         active: 0,
         sidebar,
         workspace_routes: HashMap::new(),
-        agent_routes: HashMap::new(),
+        tab_routes: HashMap::new(),
+        pane_routes: HashMap::new(),
         blit_encoder: crate::protocol::render_ansi::BlitEncoder::new(),
         repaint_pending: true,
         quit_requested: false,
@@ -788,10 +791,13 @@ fn dispatch_sidebar_action(state: &mut FleetState, action: crate::app::ClientSid
             }),
         ),
         crate::app::ClientSidebarAction::FocusWorkspace { ws_idx } => {
-            focus_sidebar_route(state, ws_idx, None)
+            focus_sidebar_route(state, ws_idx)
+        }
+        crate::app::ClientSidebarAction::FocusTab { ws_idx, tab_idx } => {
+            focus_tab_route(state, ws_idx, tab_idx)
         }
         crate::app::ClientSidebarAction::FocusPane { ws_idx, pane_id } => {
-            focus_sidebar_route(state, ws_idx, Some(pane_id))
+            focus_pane_route(state, ws_idx, pane_id)
         }
         crate::app::ClientSidebarAction::RenameStarted { ws_idx } => {
             if let Some(SidebarHit::Workspace {
@@ -930,15 +936,26 @@ fn dispatch_sidebar_action(state: &mut FleetState, action: crate::app::ClientSid
     }
 }
 
-fn focus_sidebar_route(
-    state: &mut FleetState,
-    ws_idx: usize,
-    pane_id: Option<crate::layout::PaneId>,
-) {
-    let route = pane_id
-        .and_then(|pane_id| state.agent_routes.get(&(ws_idx, pane_id)))
+fn focus_sidebar_route(state: &mut FleetState, ws_idx: usize) {
+    let route = state.workspace_routes.get(&ws_idx).cloned();
+    activate_sidebar_route(state, ws_idx, route);
+}
+
+fn focus_tab_route(state: &mut FleetState, ws_idx: usize, tab_idx: usize) {
+    let route = state.tab_routes.get(&(ws_idx, tab_idx)).cloned();
+    activate_sidebar_route(state, ws_idx, route);
+}
+
+fn focus_pane_route(state: &mut FleetState, ws_idx: usize, pane_id: crate::layout::PaneId) {
+    let route = state
+        .pane_routes
+        .get(&(ws_idx, pane_id))
         .or_else(|| state.workspace_routes.get(&ws_idx))
         .cloned();
+    activate_sidebar_route(state, ws_idx, route);
+}
+
+fn activate_sidebar_route(state: &mut FleetState, ws_idx: usize, route: Option<SidebarHit>) {
     let Some(route) = route else {
         return;
     };
@@ -951,8 +968,9 @@ fn focus_sidebar_route(
             index,
             Some(Method::WorkspaceFocus(WorkspaceTarget { workspace_id })),
         ),
-        SidebarHit::Agent { index, target } => {
-            (index, Some(Method::AgentFocus(AgentTarget { target })))
+        SidebarHit::Tab { index, tab_id } => (index, Some(Method::TabFocus(TabTarget { tab_id }))),
+        SidebarHit::Pane { index, pane_id } => {
+            (index, Some(Method::PaneFocus(PaneTarget { pane_id })))
         }
     };
     state.active = index;
@@ -1105,7 +1123,8 @@ fn reload_fleet_visual_config(state: &mut FleetState) {
 }
 
 fn sync_sidebar_model(state: &mut FleetState, cols: u16, rows: u16) {
-    let (mut model, workspace_routes, agent_routes) = build_sidebar_state(state, cols, rows);
+    let (mut model, workspace_routes, tab_routes, pane_routes) =
+        build_sidebar_state(state, cols, rows);
     state.sidebar.terminals = std::mem::take(&mut model.terminals);
     state.sidebar.workspaces = std::mem::take(&mut model.workspaces);
     state.sidebar.active = model.active;
@@ -1114,11 +1133,13 @@ fn sync_sidebar_model(state: &mut FleetState, cols: u16, rows: u16) {
         crate::app::Mode::RenameWorkspace
             | crate::app::Mode::ContextMenu
             | crate::app::Mode::ConfirmClose
+            | crate::app::Mode::Navigate
     ) {
         state.sidebar.selected = model.selected;
     }
     state.workspace_routes = workspace_routes;
-    state.agent_routes = agent_routes;
+    state.tab_routes = tab_routes;
+    state.pane_routes = pane_routes;
     update_sidebar_geometry(state, cols, rows);
 }
 
@@ -1178,6 +1199,7 @@ fn build_sidebar_state(
 ) -> (
     crate::app::AppState,
     HashMap<usize, SidebarHit>,
+    HashMap<(usize, usize), SidebarHit>,
     HashMap<(usize, crate::layout::PaneId), SidebarHit>,
 ) {
     let mut app = crate::app::AppState::empty_for_client_rendering();
@@ -1190,7 +1212,8 @@ fn build_sidebar_state(
     );
 
     let mut workspace_routes = HashMap::new();
-    let mut agent_routes = HashMap::new();
+    let mut tab_routes = HashMap::new();
+    let mut pane_routes = HashMap::new();
     let mut active_workspace = None;
 
     for (instance_idx, instance) in state.instances.iter().enumerate() {
@@ -1236,62 +1259,115 @@ fn build_sidebar_state(
 
         let snapshot = instance.snapshot.as_ref().expect("snapshot checked above");
         for workspace_info in snapshot_workspaces {
-            let agents = snapshot
-                .agents
-                .iter()
-                .filter(|agent| agent.workspace_id == workspace_info.workspace_id)
-                .collect::<Vec<_>>();
             let mut terminals = Vec::new();
-            let mut pane_terminals = Vec::new();
-            let mut focused_pane_idx = None;
+            let snapshot_tabs = snapshot
+                .tabs
+                .iter()
+                .filter(|tab| tab.workspace_id == workspace_info.workspace_id)
+                .collect::<Vec<_>>();
+            let active_tab_idx = snapshot_tabs
+                .iter()
+                .position(|tab| {
+                    tab.tab_id == workspace_info.active_tab_id
+                        || snapshot.focused_tab_id.as_deref() == Some(tab.tab_id.as_str())
+                })
+                .unwrap_or(0);
+            let mut placeholder_tabs = Vec::new();
+            let mut remote_pane_ids = Vec::new();
 
-            for agent in &agents {
-                let terminal_id = crate::terminal::TerminalId::alloc();
-                let (agent_state, seen) = native_agent_state(agent.agent_status);
-                let mut terminal = crate::terminal::TerminalState::new(
-                    terminal_id.clone(),
-                    agent
-                        .foreground_cwd
+            for tab in snapshot_tabs {
+                let snapshot_panes = snapshot
+                    .panes
+                    .iter()
+                    .filter(|pane| pane.tab_id == tab.tab_id)
+                    .collect::<Vec<_>>();
+                let mut pane_terminals = Vec::new();
+                let mut tab_remote_pane_ids = Vec::new();
+                let mut focused_pane_idx = None;
+
+                for pane in snapshot_panes {
+                    let terminal_id = crate::terminal::TerminalId::alloc();
+                    let (pane_state, seen) = native_agent_state(pane.agent_status);
+                    let mut terminal = crate::terminal::TerminalState::new(
+                        terminal_id.clone(),
+                        pane.foreground_cwd
+                            .as_deref()
+                            .or(pane.cwd.as_deref())
+                            .unwrap_or("/")
+                            .into(),
+                    );
+                    terminal.state = pane_state;
+                    terminal.detected_agent = pane
+                        .agent
                         .as_deref()
-                        .or(agent.cwd.as_deref())
-                        .unwrap_or("/")
-                        .into(),
-                );
-                terminal.state = agent_state;
-                terminal.last_agent_state_change_seq = Some(agent.state_change_seq);
-                terminal.detected_agent = agent
-                    .agent
-                    .as_deref()
-                    .or(agent.display_agent.as_deref())
-                    .and_then(crate::detect::parse_agent_label);
-                terminal.set_agent_name(agent_display_name(agent));
-                terminal.set_terminal_title(agent.terminal_title.clone());
-                patch_metadata_tokens(&mut terminal.metadata_tokens, &agent.tokens);
-                if agent.focused {
-                    focused_pane_idx = Some(pane_terminals.len());
+                        .or(pane.display_agent.as_deref())
+                        .and_then(crate::detect::parse_agent_label);
+                    if let Some(agent) = snapshot
+                        .agents
+                        .iter()
+                        .find(|agent| agent.pane_id == pane.pane_id)
+                    {
+                        terminal.last_agent_state_change_seq = Some(agent.state_change_seq);
+                        terminal.set_agent_name(agent_display_name(agent));
+                    } else if let Some(name) = pane
+                        .display_agent
+                        .as_deref()
+                        .or(pane.agent.as_deref())
+                        .or(pane.title.as_deref())
+                    {
+                        terminal.set_agent_name(name.to_string());
+                    }
+                    if let Some(label) = pane.label.clone() {
+                        terminal.set_manual_label(label);
+                    }
+                    terminal.set_terminal_title(
+                        pane.terminal_title.clone().or_else(|| pane.title.clone()),
+                    );
+                    patch_metadata_tokens(&mut terminal.metadata_tokens, &pane.tokens);
+                    if pane.focused
+                        || snapshot.focused_pane_id.as_deref() == Some(pane.pane_id.as_str())
+                    {
+                        focused_pane_idx = Some(pane_terminals.len());
+                    }
+                    pane_terminals.push((terminal_id.clone(), seen));
+                    terminals.push((terminal_id, terminal));
+                    tab_remote_pane_ids.push(pane.pane_id.clone());
                 }
-                pane_terminals.push((terminal_id.clone(), seen));
-                terminals.push((terminal_id, terminal));
+
+                placeholder_tabs.push(crate::workspace::SidebarPlaceholderTab {
+                    label: Some(tab.label.clone()),
+                    number: tab.number,
+                    pane_terminals,
+                    focused_pane_idx,
+                });
+                remote_pane_ids.push(tab_remote_pane_ids);
             }
 
-            if pane_terminals.is_empty() {
+            if placeholder_tabs.is_empty() {
                 let terminal_id = crate::terminal::TerminalId::alloc();
                 let (workspace_state, seen) = native_agent_state(workspace_info.agent_status);
                 let mut terminal =
                     crate::terminal::TerminalState::new(terminal_id.clone(), "/".into());
                 terminal.state = workspace_state;
-                pane_terminals.push((terminal_id.clone(), seen));
+                placeholder_tabs.push(crate::workspace::SidebarPlaceholderTab {
+                    label: None,
+                    number: 1,
+                    pane_terminals: vec![(terminal_id.clone(), seen)],
+                    focused_pane_idx: Some(0),
+                });
+                remote_pane_ids.push(Vec::new());
                 terminals.push((terminal_id, terminal));
             }
 
             let label = format!("{} · {}", instance.name, workspace_info.label);
-            let (mut workspace, pane_ids) = crate::workspace::Workspace::sidebar_placeholder(
-                format!("fleet:{}:{}", instance.id, workspace_info.workspace_id),
-                label,
-                workspace_info.tokens.get("branch").cloned(),
-                pane_terminals,
-                focused_pane_idx,
-            );
+            let (mut workspace, tab_pane_ids) =
+                crate::workspace::Workspace::sidebar_placeholder_with_tabs(
+                    format!("fleet:{}:{}", instance.id, workspace_info.workspace_id),
+                    label,
+                    workspace_info.tokens.get("branch").cloned(),
+                    placeholder_tabs,
+                    active_tab_idx,
+                );
             let mut workspace_tokens = workspace_info.tokens.clone();
             workspace_tokens.insert("host".to_string(), instance.name.clone());
             patch_metadata_tokens(&mut workspace.metadata_tokens, &workspace_tokens);
@@ -1300,7 +1376,6 @@ fn build_sidebar_state(
             for (terminal_id, terminal) in terminals {
                 app.terminals.insert(terminal_id, terminal);
             }
-            app.workspaces.push(workspace);
             workspace_routes.insert(
                 ws_idx,
                 SidebarHit::Workspace {
@@ -1308,15 +1383,33 @@ fn build_sidebar_state(
                     workspace_id: workspace_info.workspace_id.clone(),
                 },
             );
-            for (pane_id, agent) in pane_ids.iter().zip(agents) {
-                agent_routes.insert(
-                    (ws_idx, *pane_id),
-                    SidebarHit::Agent {
-                        index: instance_idx,
-                        target: agent.pane_id.clone(),
-                    },
-                );
+            for (tab_idx, tab) in workspace.tabs.iter().enumerate() {
+                if let Some(tab_info) = snapshot.tabs.iter().find(|tab_info| {
+                    tab_info.workspace_id == workspace_info.workspace_id
+                        && tab_info.number == tab.number
+                }) {
+                    tab_routes.insert(
+                        (ws_idx, tab_idx),
+                        SidebarHit::Tab {
+                            index: instance_idx,
+                            tab_id: tab_info.tab_id.clone(),
+                        },
+                    );
+                }
             }
+            for (pane_ids, targets) in tab_pane_ids.iter().zip(remote_pane_ids) {
+                for (pane_id, target) in pane_ids.iter().zip(targets) {
+                    pane_routes.insert(
+                        (ws_idx, *pane_id),
+                        SidebarHit::Pane {
+                            index: instance_idx,
+                            pane_id: target,
+                        },
+                    );
+                }
+            }
+
+            app.workspaces.push(workspace);
 
             if instance_idx == state.active
                 && (workspace_info.focused
@@ -1339,7 +1432,7 @@ fn build_sidebar_state(
         crate::ui::compute_workspace_card_areas(&app, app.view.sidebar_rect)
     };
 
-    (app, workspace_routes, agent_routes)
+    (app, workspace_routes, tab_routes, pane_routes)
 }
 
 fn native_agent_state(status: AgentStatus) -> (crate::detect::AgentState, bool) {
