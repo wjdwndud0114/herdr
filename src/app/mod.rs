@@ -1601,6 +1601,11 @@ pub(crate) fn client_shell_state_from_config(
     state.active = None;
     state.selected = 0;
     state.mode = state::Mode::Terminal;
+    // The client shell delegates lifecycle actions to its owning client loop.
+    // Keep detach as a request so mouse and menu input are translated through
+    // `ClientSidebarAction` instead of setting this presentation state's
+    // otherwise-unobserved `should_quit` flag.
+    state.detach_exits = false;
     state.release_notes = None;
     state.product_announcement = None;
     state
