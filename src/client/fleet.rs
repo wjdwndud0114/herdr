@@ -35,6 +35,9 @@ pub(super) fn is_enabled() -> bool {
 struct Instance {
     id: String,
     name: String,
+    remote_target: Option<String>,
+    remote_session: Option<String>,
+    bridge_connecting: bool,
     writer: Option<LocalStream>,
     api_target: Option<ConnectionTarget>,
     snapshot: Option<SessionSnapshot>,
@@ -54,6 +57,10 @@ struct ApiCommand {
 }
 
 enum FleetEvent {
+    BridgeReady {
+        instance_id: String,
+        result: Result<crate::remote::FleetRemoteBridge, String>,
+    },
     ServerMessage {
         instance_id: String,
         message: ServerMessage,
@@ -77,6 +84,7 @@ enum SidebarHit {
 
 struct FleetState {
     instances: Vec<Instance>,
+    bridges: Vec<crate::remote::FleetRemoteBridge>,
     active: usize,
     sidebar: crate::app::AppState,
     workspace_routes: HashMap<usize, SidebarHit>,
@@ -191,6 +199,9 @@ pub(super) fn run() -> io::Result<()> {
     instances.push(Instance {
         id: LOCAL_INSTANCE_ID.to_string(),
         name: "local".to_string(),
+        remote_target: None,
+        remote_session: None,
+        bridge_connecting: false,
         writer: None,
         api_target: Some(ConnectionTarget::LocalSession(crate::session::active_name())),
         snapshot: None,
@@ -208,6 +219,9 @@ pub(super) fn run() -> io::Result<()> {
         let mut instance = Instance {
             id: definition.id.as_str().to_string(),
             name: definition.name.clone(),
+            remote_target: Some(definition.target.clone()),
+            remote_session: definition.session.clone(),
+            bridge_connecting: false,
             writer: None,
             api_target: None,
             snapshot: None,
@@ -272,6 +286,7 @@ pub(super) fn run() -> io::Result<()> {
         .map_err(io::Error::other)?;
     let result = runtime.block_on(run_loop(
         instances,
+        bridges,
         cols,
         rows,
         cell_width_px,
@@ -283,7 +298,6 @@ pub(super) fn run() -> io::Result<()> {
     ));
 
     drop(terminal_guard);
-    drop(bridges);
     runtime.shutdown_timeout(Duration::from_millis(100));
     crate::logging::shutdown("client");
     result.map_err(|err| io::Error::other(err.to_string()))
@@ -313,6 +327,7 @@ fn connect_app(
 
 async fn run_loop(
     instances: Vec<Instance>,
+    bridges: Vec<crate::remote::FleetRemoteBridge>,
     cols: u16,
     rows: u16,
     initial_cell_width_px: u32,
@@ -406,6 +421,7 @@ async fn run_loop(
     };
     let mut state = FleetState {
         instances,
+        bridges,
         active: 0,
         sidebar,
         workspace_routes: HashMap::new(),
@@ -442,7 +458,12 @@ async fn run_loop(
             }
             event = fleet_rx.recv() => {
                 if let Some(event) = event {
-                    if handle_fleet_event(&mut state, event) {
+                    if handle_fleet_event(
+                        &mut state,
+                        event,
+                        &fleet_tx,
+                        &should_quit,
+                    ) {
                         sync_sidebar_model(&mut state, current_cols, current_rows);
                     }
                     render(&mut state, current_cols, current_rows);
@@ -496,6 +517,31 @@ fn reconnect_content_streams(
     let content = state.sidebar.view.terminal_area;
     for instance in &mut state.instances {
         if instance.writer.is_some() {
+            continue;
+        }
+        if instance.client_socket.is_none() {
+            if instance.bridge_connecting {
+                continue;
+            }
+            let Some(target) = instance.remote_target.clone() else {
+                continue;
+            };
+            let instance_id = instance.id.clone();
+            let session = instance.remote_session.clone();
+            let bridge_tx = event_tx.clone();
+            instance.bridge_connecting = true;
+            std::thread::spawn(move || {
+                let result = crate::remote::retry_fleet_remote_bridge(
+                    &target,
+                    session.as_deref(),
+                    &instance_id,
+                )
+                .map_err(|err| err.to_string());
+                let _ = bridge_tx.blocking_send(FleetEvent::BridgeReady {
+                    instance_id,
+                    result,
+                });
+            });
             continue;
         }
         let Some(socket) = instance.client_socket.clone() else {
@@ -729,9 +775,15 @@ fn watch_instance_events(
     Ok(false)
 }
 
-fn handle_fleet_event(state: &mut FleetState, event: FleetEvent) -> bool {
+fn handle_fleet_event(
+    state: &mut FleetState,
+    event: FleetEvent,
+    event_tx: &tokio::sync::mpsc::Sender<FleetEvent>,
+    should_quit: &Arc<AtomicBool>,
+) -> bool {
     let instance_id = match &event {
-        FleetEvent::ServerMessage { instance_id, .. }
+        FleetEvent::BridgeReady { instance_id, .. }
+        | FleetEvent::ServerMessage { instance_id, .. }
         | FleetEvent::Disconnected { instance_id }
         | FleetEvent::Snapshot { instance_id, .. } => instance_id,
     };
@@ -744,6 +796,31 @@ fn handle_fleet_event(state: &mut FleetState, event: FleetEvent) -> bool {
     };
 
     match event {
+        FleetEvent::BridgeReady { result, .. } => {
+            state.instances[index].bridge_connecting = false;
+            match result {
+                Ok(bridge) => {
+                    let client_socket = bridge.client_socket().to_path_buf();
+                    let api_target =
+                        ConnectionTarget::SocketPath(bridge.api_socket().to_path_buf());
+                    state.instances[index].client_socket = Some(client_socket);
+                    state.instances[index].api_target = Some(api_target.clone());
+                    state.instances[index].request_tx =
+                        Some(spawn_api_worker(api_target.clone(), should_quit.clone()));
+                    spawn_snapshot_watcher(
+                        state.instances[index].id.clone(),
+                        api_target,
+                        event_tx.clone(),
+                        should_quit.clone(),
+                    );
+                    state.instances[index].error = None;
+                    state.bridges.push(bridge);
+                }
+                Err(err) => state.instances[index].error = Some(err),
+            }
+            state.host.request_repaint();
+            true
+        }
         FleetEvent::ServerMessage { message, .. } => match message {
             ServerMessage::Frame(frame) => {
                 state.instances[index].frame = Some(frame);
