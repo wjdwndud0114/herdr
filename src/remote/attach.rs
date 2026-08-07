@@ -183,6 +183,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         &prepared_remote.remote_herdr,
         prepared_remote.stop_after_install_approved,
         remote.live_handoff,
+        true,
     )?;
 
     let _bridge = SshStdioBridge::start(
@@ -725,7 +726,6 @@ fn prepare_fleet_remote_herdr(ssh: &RemoteSsh) -> io::Result<PreparedRemoteHerdr
 
     Ok(PreparedRemoteHerdr {
         remote_herdr,
-        installed_or_replaced: false,
         stop_after_install_approved: false,
     })
 }
@@ -1037,6 +1037,7 @@ fn ensure_remote_server_ready(
     remote_herdr: &RemoteHerdr,
     stop_after_install_approved: bool,
     live_handoff_enabled: bool,
+    restart_prompt_allowed: bool,
 ) -> io::Result<()> {
     let status = remote_server_status(ssh, remote_herdr)?;
     let RemoteServerStatus::Running {
@@ -1068,6 +1069,13 @@ fn ensure_remote_server_ready(
     if stop_after_install_approved {
         stop_remote_server(ssh, remote_herdr)?;
         return Ok(());
+    }
+
+    if !restart_prompt_allowed {
+        return Err(io::Error::other(format!(
+            "remote herdr server on {} requires an interactive restart",
+            ssh.target()
+        )));
     }
 
     if confirm_remote_server_stop(ssh.target(), version.as_deref(), reason)? {
@@ -1845,6 +1853,23 @@ pub(crate) fn start_fleet_remote_bridge(
     session: Option<&str>,
     instance_id: &str,
 ) -> io::Result<FleetRemoteBridge> {
+    start_fleet_remote_bridge_inner(target, session, instance_id, true)
+}
+
+pub(crate) fn retry_fleet_remote_bridge(
+    target: &str,
+    session: Option<&str>,
+    instance_id: &str,
+) -> io::Result<FleetRemoteBridge> {
+    start_fleet_remote_bridge_inner(target, session, instance_id, false)
+}
+
+fn start_fleet_remote_bridge_inner(
+    target: &str,
+    session: Option<&str>,
+    instance_id: &str,
+    restart_prompt_allowed: bool,
+) -> io::Result<FleetRemoteBridge> {
     validate_remote_target(target)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
     let session_name = session.unwrap_or(crate::session::DEFAULT_SESSION_NAME);
@@ -1857,9 +1882,9 @@ pub(crate) fn start_fleet_remote_bridge(
     ensure_remote_server_ready(
         &remote_ssh,
         &prepared_remote.remote_herdr,
-        prepared_remote.installed_or_replaced,
         prepared_remote.stop_after_install_approved,
         false,
+        restart_prompt_allowed,
     )?;
 
     let client_socket =
