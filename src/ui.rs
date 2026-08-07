@@ -17,7 +17,6 @@ mod scrollbar;
 mod settings;
 mod sidebar;
 mod status;
-pub(crate) use self::status::set_working_animation_frame;
 mod tab_surface;
 mod tabs;
 mod text;

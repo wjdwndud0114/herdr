@@ -1806,29 +1806,51 @@ impl SshStdioBridge {
         let thread_stop = Arc::clone(&should_stop);
         let thread_ssh_options = ssh_options.cloned();
         let thread = thread::spawn(move || {
+            let mut connections: Vec<JoinHandle<()>> = Vec::new();
             while !thread_stop.load(Ordering::Acquire) {
+                let mut pending = Vec::with_capacity(connections.len());
+                for connection in connections.drain(..) {
+                    if connection.is_finished() {
+                        let _ = connection.join();
+                    } else {
+                        pending.push(connection);
+                    }
+                }
+                connections = pending;
+
                 match listener.accept() {
                     Ok(stream) => {
-                        if let Err(err) = bridge_connection(
-                            stream,
-                            &target,
-                            &remote_herdr,
-                            &session_name,
-                            thread_ssh_options.as_ref(),
-                            &thread_stop,
-                            endpoint,
-                        ) {
-                            eprintln!("herdr: remote bridge failed: {err}");
-                        }
+                        let connection_target = target.clone();
+                        let connection_herdr = remote_herdr.clone();
+                        let connection_session = session_name.clone();
+                        let connection_ssh_options = thread_ssh_options.clone();
+                        let connection_stop = Arc::clone(&thread_stop);
+                        connections.push(thread::spawn(move || {
+                            if let Err(err) = bridge_connection(
+                                stream,
+                                &connection_target,
+                                &connection_herdr,
+                                &connection_session,
+                                connection_ssh_options.as_ref(),
+                                &connection_stop,
+                                endpoint,
+                            ) {
+                                eprintln!("herdr: remote bridge failed: {err}");
+                            }
+                        }));
                     }
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                         thread::sleep(BRIDGE_ACCEPT_POLL);
                     }
                     Err(err) => {
                         eprintln!("herdr: remote bridge listener failed: {err}");
+                        thread_stop.store(true, Ordering::Release);
                         break;
                     }
                 }
+            }
+            for connection in connections {
+                let _ = connection.join();
             }
         });
 
