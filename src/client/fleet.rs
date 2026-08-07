@@ -100,7 +100,6 @@ struct FleetState {
     cell_width_px: u32,
     cell_height_px: u32,
     last_reconnect_attempt: Instant,
-    working_animation_frame: u8,
     visual: FleetVisualConfig,
 }
 
@@ -437,7 +436,6 @@ async fn run_loop(
         cell_width_px: initial_cell_width_px,
         cell_height_px: initial_cell_height_px,
         last_reconnect_attempt: Instant::now(),
-        working_animation_frame: 0,
         visual,
     };
     let mut current_cols = cols;
@@ -477,18 +475,6 @@ async fn run_loop(
                     &fleet_tx,
                     &should_quit,
                 );
-                if state
-                    .sidebar
-                    .terminals
-                    .values()
-                    .any(|terminal| terminal.state == crate::detect::AgentState::Working)
-                {
-                    state.working_animation_frame = (state.working_animation_frame + 1) % 4;
-                    crate::ui::set_working_animation_frame(Some(state.working_animation_frame));
-                    render(&mut state, current_cols, current_rows);
-                } else {
-                    crate::ui::set_working_animation_frame(None);
-                }
             }
         }
     }
@@ -498,7 +484,6 @@ async fn run_loop(
             let _ = super::write_to_server(writer, &ClientMessage::Detach);
         }
     }
-    crate::ui::set_working_animation_frame(None);
     Ok(())
 }
 
