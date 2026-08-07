@@ -184,6 +184,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         prepared_remote.installed_or_replaced,
         prepared_remote.stop_after_install_approved,
         remote.live_handoff,
+        true,
     )?;
 
     let _bridge = SshStdioBridge::start(
@@ -1032,6 +1033,7 @@ fn ensure_remote_server_ready(
     remote_binary_changed: bool,
     stop_after_install_approved: bool,
     live_handoff_enabled: bool,
+    restart_prompt_allowed: bool,
 ) -> io::Result<()> {
     let status = remote_server_status(ssh, remote_herdr)?;
     let RemoteServerStatus::Running {
@@ -1064,12 +1066,19 @@ fn ensure_remote_server_ready(
     }
 
     if stop_after_install_approved {
-        stop_remote_server(ssh, remote_herdr)?;
+        stop_remote_server(ssh, remote_herdr, reason)?;
         return Ok(());
     }
 
+    if !restart_prompt_allowed {
+        return Err(io::Error::other(format!(
+            "remote herdr server on {} requires an interactive restart",
+            ssh.target()
+        )));
+    }
+
     if confirm_remote_server_stop(ssh.target(), version.as_deref(), protocol, reason)? {
-        stop_remote_server(ssh, remote_herdr)?;
+        stop_remote_server(ssh, remote_herdr, reason)?;
     }
     Ok(())
 }
@@ -1386,26 +1395,61 @@ fn live_handoff_remote_server(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) -> io
     Ok(())
 }
 
-fn stop_remote_server(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) -> io::Result<()> {
+fn stop_remote_server(
+    ssh: &RemoteSsh,
+    remote_herdr: &RemoteHerdr,
+    reason: RemoteServerRestartReason,
+) -> io::Result<()> {
     let command = format!("{} server stop", remote_herdr.shell_path);
     let output = ssh.sh_output(&command)?;
     if !output.status.success() {
         return Err(command_failed("remote server stop failed", &output));
     }
 
-    wait_for_remote_server_shutdown(ssh, remote_herdr)?;
-    eprintln!(
-        "stopped the remote herdr server on {}; it will restart when the remote client bridge attaches.",
-        ssh.target()
-    );
+    match wait_for_remote_server_shutdown(ssh, remote_herdr, reason)? {
+        RemoteServerStopOutcome::Stopped => eprintln!(
+            "stopped the remote herdr server on {}; it will restart when the remote client bridge attaches.",
+            ssh.target()
+        ),
+        RemoteServerStopOutcome::ReplacementReady => eprintln!(
+            "the remote herdr server on {} was already restarted by another client; attaching to it.",
+            ssh.target()
+        ),
+    }
     Ok(())
 }
 
-fn wait_for_remote_server_shutdown(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) -> io::Result<()> {
+enum RemoteServerStopOutcome {
+    Stopped,
+    ReplacementReady,
+}
+
+fn wait_for_remote_server_shutdown(
+    ssh: &RemoteSsh,
+    remote_herdr: &RemoteHerdr,
+    reason: RemoteServerRestartReason,
+) -> io::Result<RemoteServerStopOutcome> {
     let deadline = Instant::now() + REMOTE_SERVER_SHUTDOWN_CONFIRM_TIMEOUT;
     loop {
-        if remote_server_status(ssh, remote_herdr)? == RemoteServerStatus::NotRunning {
-            return Ok(());
+        match remote_server_status(ssh, remote_herdr)? {
+            RemoteServerStatus::NotRunning => return Ok(RemoteServerStopOutcome::Stopped),
+            RemoteServerStatus::Running {
+                version,
+                protocol,
+                detached_server_daemon,
+                ..
+            } if remote_replacement_satisfies_restart(
+                reason,
+                version.as_deref(),
+                protocol,
+                detached_server_daemon,
+            ) =>
+            {
+                // A second remote client can reconnect during the stop probe
+                // and launch the prepared daemon before we observe downtime.
+                return Ok(RemoteServerStopOutcome::ReplacementReady);
+            }
+            RemoteServerStatus::Running { .. } => {}
         }
         if Instant::now() >= deadline {
             return Err(io::Error::new(
@@ -1418,6 +1462,24 @@ fn wait_for_remote_server_shutdown(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) 
             ));
         }
         thread::sleep(REMOTE_SERVER_SHUTDOWN_POLL_INTERVAL);
+    }
+}
+
+fn remote_replacement_satisfies_restart(
+    reason: RemoteServerRestartReason,
+    version: Option<&str>,
+    protocol: Option<u32>,
+    detached_server_daemon: bool,
+) -> bool {
+    match reason {
+        RemoteServerRestartReason::ProtocolMismatch => protocol == Some(CURRENT_PROTOCOL),
+        RemoteServerRestartReason::DaemonDetachMissing => detached_server_daemon,
+        RemoteServerRestartReason::VersionMismatch => {
+            version == Some(current_version().as_str()) && protocol == Some(CURRENT_PROTOCOL)
+        }
+        // The public version and protocol do not distinguish an old process
+        // from a same-version server launched from the replaced executable.
+        RemoteServerRestartReason::BinaryUpdated => false,
     }
 }
 
@@ -1815,6 +1877,23 @@ pub(crate) fn start_fleet_remote_bridge(
     session: Option<&str>,
     instance_id: &str,
 ) -> io::Result<FleetRemoteBridge> {
+    start_fleet_remote_bridge_inner(target, session, instance_id, true)
+}
+
+pub(crate) fn retry_fleet_remote_bridge(
+    target: &str,
+    session: Option<&str>,
+    instance_id: &str,
+) -> io::Result<FleetRemoteBridge> {
+    start_fleet_remote_bridge_inner(target, session, instance_id, false)
+}
+
+fn start_fleet_remote_bridge_inner(
+    target: &str,
+    session: Option<&str>,
+    instance_id: &str,
+    restart_prompt_allowed: bool,
+) -> io::Result<FleetRemoteBridge> {
     validate_remote_target(target)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
     let session_name = session.unwrap_or(crate::session::DEFAULT_SESSION_NAME);
@@ -1830,6 +1909,7 @@ pub(crate) fn start_fleet_remote_bridge(
         prepared_remote.installed_or_replaced,
         prepared_remote.stop_after_install_approved,
         false,
+        restart_prompt_allowed,
     )?;
 
     let client_socket =
