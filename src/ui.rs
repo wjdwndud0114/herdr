@@ -1,7 +1,8 @@
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
-    text::Span,
+    text::{Line, Span},
+    widgets::{Paragraph, Wrap},
     Frame,
 };
 
@@ -116,6 +117,67 @@ pub(crate) fn render_client_shell(app: &AppState, frame: &mut Frame) {
         frame,
         app.view.terminal_area,
         app.view.terminal_area,
+    );
+}
+
+/// Render a selected client connection failure inside the normal content area.
+/// The Fleet shell owns this presentation state; remote runtime state remains
+/// on the corresponding server.
+pub(crate) fn render_client_connection_error(
+    frame: &mut Frame,
+    area: Rect,
+    instance_name: &str,
+    error: &str,
+    palette: &crate::app::state::Palette,
+) {
+    let Some(popup) = widgets::centered_popup_rect(area, 72, 9) else {
+        frame.render_widget(
+            Paragraph::new(error)
+                .style(Style::default().fg(palette.red))
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+        return;
+    };
+    let Some(inner) = widgets::render_panel_shell(frame, popup, palette.red, palette.panel_bg)
+    else {
+        return;
+    };
+    let [title, status, _, error_label, error_body] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+    ])
+    .areas(inner);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("● ", Style::default().fg(palette.red)),
+            Span::styled(
+                format!("{instance_name} is offline"),
+                Style::default()
+                    .fg(palette.text)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])),
+        title,
+    );
+    frame.render_widget(
+        Paragraph::new("reconnecting in the background…")
+            .style(Style::default().fg(palette.overlay0)),
+        status,
+    );
+    frame.render_widget(
+        Paragraph::new("last connection error").style(Style::default().fg(palette.subtext0)),
+        error_label,
+    );
+    frame.render_widget(
+        Paragraph::new(error)
+            .style(Style::default().fg(palette.red))
+            .wrap(Wrap { trim: false }),
+        error_body,
     );
 }
 
