@@ -3,7 +3,7 @@
 use super::shell_quote;
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{self, IsTerminal, Write as _};
+use std::io::{self, IsTerminal, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -14,7 +14,7 @@ use interprocess::TryClone as _;
 use serde::Deserialize;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -1715,6 +1715,7 @@ fn command_failed(context: &str, output: &Output) -> io::Error {
 struct SshStdioBridge {
     local_socket: PathBuf,
     socket_identity: crate::ipc::SocketFileIdentity,
+    last_error: Arc<Mutex<Option<String>>>,
     should_stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -1734,6 +1735,7 @@ impl SshStdioBridge {
             session_name,
             ssh_options,
             RemoteBridgeEndpoint::Client,
+            true,
         )
     }
 
@@ -1744,6 +1746,7 @@ impl SshStdioBridge {
         session_name: String,
         ssh_options: Option<&ManagedSshOptions>,
         endpoint: RemoteBridgeEndpoint,
+        report_errors_to_terminal: bool,
     ) -> io::Result<Self> {
         crate::ipc::prepare_socket_path(&local_socket, |path| {
             format!("remote bridge is already listening at {}", path.display())
@@ -1763,6 +1766,8 @@ impl SshStdioBridge {
 
         let should_stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&should_stop);
+        let last_error = Arc::new(Mutex::new(None));
+        let thread_error = Arc::clone(&last_error);
         let thread_ssh_options = ssh_options.cloned();
         let thread = thread::spawn(move || {
             let mut connections: Vec<JoinHandle<()>> = Vec::new();
@@ -1784,11 +1789,20 @@ impl SshStdioBridge {
                         let connection_session = session_name.clone();
                         let connection_ssh_options = thread_ssh_options.clone();
                         let connection_stop = Arc::clone(&thread_stop);
+                        let connection_error = Arc::clone(&thread_error);
                         connections.push(thread::spawn(move || {
+                            set_bridge_error(&connection_error, None);
                             let stream = match prepare_remote_bridge_stream(stream) {
                                 Ok(stream) => stream,
                                 Err(err) => {
-                                    tracing::error!(
+                                    let message = err.to_string();
+                                    set_bridge_error(&connection_error, Some(message.clone()));
+                                    if report_errors_to_terminal {
+                                        eprintln!(
+                                            "remote bridge failed to prepare client socket: {err}"
+                                        );
+                                    }
+                                    tracing::warn!(
                                         error = %err,
                                         "remote bridge failed to prepare client socket"
                                     );
@@ -1804,7 +1818,16 @@ impl SshStdioBridge {
                                 &connection_stop,
                                 endpoint,
                             ) {
-                                eprintln!("herdr: remote bridge failed: {err}");
+                                let message = err.to_string();
+                                set_bridge_error(&connection_error, Some(message));
+                                if report_errors_to_terminal {
+                                    eprintln!("remote bridge connection failed: {err}");
+                                }
+                                tracing::warn!(
+                                    target = %connection_target,
+                                    error = %err,
+                                    "remote bridge connection failed"
+                                );
                             }
                         }));
                     }
@@ -1812,7 +1835,11 @@ impl SshStdioBridge {
                         thread::sleep(BRIDGE_ACCEPT_POLL);
                     }
                     Err(err) => {
-                        eprintln!("herdr: remote bridge listener failed: {err}");
+                        set_bridge_error(&thread_error, Some(err.to_string()));
+                        if report_errors_to_terminal {
+                            eprintln!("remote bridge listener failed: {err}");
+                        }
+                        tracing::warn!(error = %err, "remote bridge listener failed");
                         thread_stop.store(true, Ordering::Release);
                         break;
                     }
@@ -1826,10 +1853,21 @@ impl SshStdioBridge {
         Ok(Self {
             local_socket,
             socket_identity,
+            last_error,
             should_stop,
             thread: Some(thread),
         })
     }
+}
+
+fn set_bridge_error(slot: &Mutex<Option<String>>, error: Option<String>) {
+    *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = error;
+}
+
+fn bridge_error(slot: &Mutex<Option<String>>) -> Option<String> {
+    slot.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
 }
 
 fn prepare_remote_bridge_stream(
@@ -1860,6 +1898,22 @@ pub(crate) struct FleetRemoteBridge {
     _remote_ssh: RemoteSsh,
 }
 
+#[derive(Clone)]
+pub(crate) struct FleetRemoteBridgeStatus {
+    client_error: Arc<Mutex<Option<String>>>,
+    api_error: Arc<Mutex<Option<String>>>,
+}
+
+impl FleetRemoteBridgeStatus {
+    pub(crate) fn client_error(&self) -> Option<String> {
+        bridge_error(&self.client_error)
+    }
+
+    pub(crate) fn api_error(&self) -> Option<String> {
+        bridge_error(&self.api_error)
+    }
+}
+
 impl FleetRemoteBridge {
     pub(crate) fn client_socket(&self) -> &Path {
         &self.client.local_socket
@@ -1867,6 +1921,13 @@ impl FleetRemoteBridge {
 
     pub(crate) fn api_socket(&self) -> &Path {
         &self.api.local_socket
+    }
+
+    pub(crate) fn status(&self) -> FleetRemoteBridgeStatus {
+        FleetRemoteBridgeStatus {
+            client_error: Arc::clone(&self.client.last_error),
+            api_error: Arc::clone(&self.api.last_error),
+        }
     }
 }
 
@@ -1920,6 +1981,7 @@ fn start_fleet_remote_bridge_inner(
         session_name.to_string(),
         remote_ssh.options(),
         RemoteBridgeEndpoint::Client,
+        false,
     )?;
     let api = SshStdioBridge::start_endpoint(
         target.to_string(),
@@ -1928,6 +1990,7 @@ fn start_fleet_remote_bridge_inner(
         session_name.to_string(),
         remote_ssh.options(),
         RemoteBridgeEndpoint::Api,
+        false,
     )?;
 
     Ok(FleetRemoteBridge {
@@ -2020,7 +2083,7 @@ fn bridge_connection(
         ))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        .stderr(Stdio::piped());
 
     let mut child = command
         .spawn()
@@ -2036,6 +2099,7 @@ fn bridge_connection(
     let mut stream_to_child = stream.try_clone()?;
     let shutdown_stream = stream.try_clone()?;
     let mut child_to_stream = stream;
+    let stderr_reader = spawn_bridge_stderr_reader(child.stderr.take());
 
     let upload = thread::spawn(move || {
         let _ = copy_flush(&mut stream_to_child, &mut child_stdin);
@@ -2061,14 +2125,12 @@ fn bridge_connection(
     let _ = crate::ipc::shutdown_local_stream(&shutdown_stream);
     let _ = upload.join();
     let _ = download.join();
+    let stderr = join_bridge_stderr_reader(stderr_reader);
 
     if status.success() || bridge_stop.load(Ordering::Acquire) {
         Ok(())
     } else {
-        Err(io::Error::new(
-            io::ErrorKind::ConnectionAborted,
-            format!("ssh bridge exited with {status}"),
-        ))
+        Err(bridge_exit_error(status, &stderr))
     }
 }
 
@@ -2094,7 +2156,7 @@ fn bridge_connection(
         ))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        .stderr(Stdio::piped());
 
     let mut child = command
         .spawn()
@@ -2121,6 +2183,7 @@ fn bridge_connection(
         return Err(err);
     }
     let mut child_to_stream = stream;
+    let stderr_reader = spawn_bridge_stderr_reader(child.stderr.take());
 
     let connection_stop = Arc::new(AtomicBool::new(false));
     let upload_stop = Arc::new(AtomicBool::new(false));
@@ -2204,6 +2267,7 @@ fn bridge_connection(
     let download_result = download
         .join()
         .map_err(|_| io::Error::other("remote bridge download worker panicked"))?;
+    let stderr = join_bridge_stderr_reader(stderr_reader);
     let status = status_result?;
 
     let stopping = bridge_stop.load(Ordering::Acquire);
@@ -2220,11 +2284,45 @@ fn bridge_connection(
     if status.success() || stopping || client_closed {
         Ok(())
     } else {
-        Err(io::Error::new(
-            io::ErrorKind::ConnectionAborted,
-            format!("ssh bridge exited with {status}"),
-        ))
+        Err(bridge_exit_error(status, &stderr))
     }
+}
+
+fn spawn_bridge_stderr_reader(stderr: Option<std::process::ChildStderr>) -> JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut stderr) = stderr {
+            let _ = stderr.read_to_end(&mut bytes);
+        }
+        bytes
+    })
+}
+
+fn join_bridge_stderr_reader(reader: JoinHandle<Vec<u8>>) -> Vec<u8> {
+    match reader.join() {
+        Ok(stderr) => stderr,
+        Err(_) => Vec::new(),
+    }
+}
+
+fn bridge_exit_error(status: std::process::ExitStatus, stderr: &[u8]) -> io::Error {
+    let detail = String::from_utf8_lossy(stderr)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let detail: String = detail
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(2_048)
+        .collect();
+    let message = if detail.is_empty() {
+        format!("ssh bridge exited with {status}")
+    } else {
+        format!("ssh bridge exited with {status}: {detail}")
+    };
+    io::Error::new(io::ErrorKind::ConnectionAborted, message)
 }
 
 #[cfg(unix)]
