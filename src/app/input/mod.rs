@@ -265,7 +265,7 @@ pub(crate) fn handle_client_sidebar_mouse(
     } else {
         None
     };
-    let action = state.handle_mouse(&mut runtimes, mouse);
+    let action = state.handle_mouse(&mut runtimes, super::LOCAL_INPUT_SOURCE, mouse);
     let mut action = match action {
         Some(MouseAction::NewWorkspace) => Some(ClientSidebarAction::NewWorkspace),
         Some(MouseAction::FocusWorkspace { ws_idx }) => {

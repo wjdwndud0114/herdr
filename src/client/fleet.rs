@@ -38,12 +38,15 @@ struct Instance {
     remote_target: Option<String>,
     remote_session: Option<String>,
     bridge_connecting: bool,
+    content_connecting: bool,
+    bridge_status: Option<crate::remote::FleetRemoteBridgeStatus>,
     writer: Option<LocalStream>,
     api_target: Option<ConnectionTarget>,
     snapshot: Option<SessionSnapshot>,
     frame: Option<FrameData>,
     error: Option<String>,
     mouse_capture: bool,
+    mouse_sgr_pixels: bool,
     keyboard_report_all: bool,
     prefix_input_active: bool,
     window_title: Option<String>,
@@ -60,6 +63,10 @@ enum FleetEvent {
     BridgeReady {
         instance_id: String,
         result: Result<crate::remote::FleetRemoteBridge, String>,
+    },
+    ContentReady {
+        instance_id: String,
+        result: Result<LocalStream, String>,
     },
     ServerMessage {
         instance_id: String,
@@ -95,6 +102,7 @@ struct FleetState {
     quit_requested: bool,
     host: super::ClientState,
     host_mouse_capture: Arc<AtomicBool>,
+    host_sgr_pixels: Arc<AtomicBool>,
     prefix_input_source: crate::platform::RealPrefixInputSource,
     pending_prefix_bytes: Vec<u8>,
     cell_width_px: u32,
@@ -187,7 +195,7 @@ pub(super) fn run() -> io::Result<()> {
         sidebar.sidebar_section_split = split;
     }
     sidebar.collapsed_space_keys = registry.presentation().collapsed_space_keys.clone();
-    let (cols, rows, cell_width_px, cell_height_px) =
+    let (cols, rows, cell_width_px, cell_height_px, _exact_cell_size) =
         super::initial_terminal_geometry(visual.kitty_graphics_enabled);
     crate::ui::compute_client_shell_view(&mut sidebar, Rect::new(0, 0, cols, rows));
     let content = sidebar.view.terminal_area;
@@ -201,12 +209,15 @@ pub(super) fn run() -> io::Result<()> {
         remote_target: None,
         remote_session: None,
         bridge_connecting: false,
+        content_connecting: false,
+        bridge_status: None,
         writer: None,
         api_target: Some(ConnectionTarget::LocalSession(crate::session::active_name())),
         snapshot: None,
         frame: None,
         error: None,
         mouse_capture,
+        mouse_sgr_pixels: false,
         keyboard_report_all: false,
         prefix_input_active: false,
         window_title: None,
@@ -221,12 +232,15 @@ pub(super) fn run() -> io::Result<()> {
             remote_target: Some(definition.target.clone()),
             remote_session: definition.session.clone(),
             bridge_connecting: false,
+            content_connecting: false,
+            bridge_status: None,
             writer: None,
             api_target: None,
             snapshot: None,
             frame: None,
             error: None,
             mouse_capture,
+            mouse_sgr_pixels: false,
             keyboard_report_all: false,
             prefix_input_active: false,
             window_title: None,
@@ -241,19 +255,9 @@ pub(super) fn run() -> io::Result<()> {
             Ok(bridge) => {
                 let client_socket = bridge.client_socket().to_path_buf();
                 let api_socket = bridge.api_socket().to_path_buf();
+                instance.bridge_status = Some(bridge.status());
                 instance.api_target = Some(ConnectionTarget::SocketPath(api_socket));
-                instance.client_socket = Some(client_socket.clone());
-                instance.writer = connect_app(
-                    &client_socket,
-                    content_cols,
-                    content_rows,
-                    cell_width_px,
-                    cell_height_px,
-                )
-                .ok();
-                if instance.writer.is_none() {
-                    instance.error = Some("app connection failed".to_string());
-                }
+                instance.client_socket = Some(client_socket);
                 bridges.push(bridge);
             }
             Err(err) => instance.error = Some(err.to_string()),
@@ -317,6 +321,7 @@ fn connect_app(
         rows,
         cell_width_px,
         cell_height_px,
+        false,
         RenderEncoding::SemanticFrame,
         false,
         AppSurface::Content,
@@ -339,13 +344,26 @@ async fn run_loop(
     let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(256);
     let (fleet_tx, mut fleet_rx) = tokio::sync::mpsc::channel::<FleetEvent>(256);
     let host_mouse_capture = Arc::new(AtomicBool::new(mouse_capture));
+    let host_sgr_pixels = Arc::new(AtomicBool::new(false));
 
     let will_query_host_terminal_theme = super::should_query_host_terminal_theme();
     let will_query_host_cell_size =
         super::host_cell_size_query_required(visual.kitty_graphics_enabled);
     let stdin_quit = should_quit.clone();
     let stdin_capture = host_mouse_capture.clone();
+    let stdin_sgr_pixels = host_sgr_pixels.clone();
     let stdin_tx = input_tx.clone();
+    #[cfg(unix)]
+    let direct_graphics_response = Arc::new(std::sync::Mutex::new(
+        super::direct_graphics::ResponseMatcher::default(),
+    ));
+    #[cfg(unix)]
+    let stdin_direct_response = direct_graphics_response.clone();
+    #[cfg(unix)]
+    let stdin_direct_response_active = stdin_direct_response
+        .lock()
+        .map(|matcher| matcher.active_handle())
+        .unwrap_or_default();
     std::thread::spawn(move || {
         super::input::stdin_reader_loop(
             stdin_tx,
@@ -353,6 +371,11 @@ async fn run_loop(
             will_query_host_terminal_theme,
             will_query_host_cell_size,
             stdin_capture,
+            stdin_sgr_pixels,
+            #[cfg(unix)]
+            stdin_direct_response,
+            #[cfg(unix)]
+            stdin_direct_response_active,
         );
     });
     if will_query_host_terminal_theme {
@@ -410,6 +433,10 @@ async fn run_loop(
         reported_size: (cols, rows),
         sound_config: visual.sound.clone(),
         kitty_graphics_enabled: visual.kitty_graphics_enabled,
+        #[cfg(unix)]
+        direct_graphics_response,
+        #[cfg(unix)]
+        retired_direct_graphics: None,
         attach_escape: None,
         #[cfg(unix)]
         mouse_scroll_lines: visual.mouse_scroll_lines,
@@ -431,6 +458,7 @@ async fn run_loop(
         quit_requested: false,
         host,
         host_mouse_capture,
+        host_sgr_pixels,
         prefix_input_source: crate::platform::RealPrefixInputSource::default(),
         pending_prefix_bytes: Vec::new(),
         cell_width_px: initial_cell_width_px,
@@ -456,15 +484,18 @@ async fn run_loop(
             }
             event = fleet_rx.recv() => {
                 if let Some(event) = event {
-                    if handle_fleet_event(
+                    let (sidebar_changed, render_requested) = handle_fleet_event(
                         &mut state,
                         event,
                         &fleet_tx,
                         &should_quit,
-                    ) {
+                    );
+                    if sidebar_changed {
                         sync_sidebar_model(&mut state, current_cols, current_rows);
                     }
-                    render(&mut state, current_cols, current_rows);
+                    if render_requested {
+                        render(&mut state, current_cols, current_rows);
+                    }
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(100)) => {
@@ -473,7 +504,6 @@ async fn run_loop(
                     current_cols,
                     current_rows,
                     &fleet_tx,
-                    &should_quit,
                 );
             }
         }
@@ -492,7 +522,6 @@ fn reconnect_content_streams(
     cols: u16,
     rows: u16,
     event_tx: &tokio::sync::mpsc::Sender<FleetEvent>,
-    should_quit: &Arc<AtomicBool>,
 ) {
     if state.last_reconnect_attempt.elapsed() < RECONNECT_INTERVAL {
         return;
@@ -501,7 +530,7 @@ fn reconnect_content_streams(
     update_sidebar_geometry(state, cols, rows);
     let content = state.sidebar.view.terminal_area;
     for instance in &mut state.instances {
-        if instance.writer.is_some() {
+        if instance.writer.is_some() || instance.content_connecting {
             continue;
         }
         if instance.client_socket.is_none() {
@@ -532,30 +561,27 @@ fn reconnect_content_streams(
         let Some(socket) = instance.client_socket.clone() else {
             continue;
         };
-        match connect_app(
-            &socket,
-            content.width.max(2),
-            content.height.max(1),
-            state.cell_width_px,
-            state.cell_height_px,
-        ) {
-            Ok(writer) => {
-                let Ok(reader) = writer.try_clone() else {
-                    continue;
-                };
-                spawn_server_reader(
-                    instance.id.clone(),
-                    reader,
-                    event_tx.clone(),
-                    should_quit.clone(),
-                    state.host.kitty_graphics_enabled,
-                );
-                instance.writer = Some(writer);
-                instance.error = None;
-                state.host.request_repaint();
-            }
-            Err(err) => instance.error = Some(err.to_string()),
-        }
+        let instance_id = instance.id.clone();
+        let content_tx = event_tx.clone();
+        let content_cols = content.width.max(2);
+        let content_rows = content.height.max(1);
+        let cell_width_px = state.cell_width_px;
+        let cell_height_px = state.cell_height_px;
+        instance.content_connecting = true;
+        std::thread::spawn(move || {
+            let result = connect_app(
+                &socket,
+                content_cols,
+                content_rows,
+                cell_width_px,
+                cell_height_px,
+            )
+            .map_err(|err| err.to_string());
+            let _ = content_tx.blocking_send(FleetEvent::ContentReady {
+                instance_id,
+                result,
+            });
+        });
     }
 }
 
@@ -765,9 +791,10 @@ fn handle_fleet_event(
     event: FleetEvent,
     event_tx: &tokio::sync::mpsc::Sender<FleetEvent>,
     should_quit: &Arc<AtomicBool>,
-) -> bool {
+) -> (bool, bool) {
     let instance_id = match &event {
         FleetEvent::BridgeReady { instance_id, .. }
+        | FleetEvent::ContentReady { instance_id, .. }
         | FleetEvent::ServerMessage { instance_id, .. }
         | FleetEvent::Disconnected { instance_id }
         | FleetEvent::Snapshot { instance_id, .. } => instance_id,
@@ -777,17 +804,18 @@ fn handle_fleet_event(
         .iter()
         .position(|instance| &instance.id == instance_id)
     else {
-        return false;
+        return (false, false);
     };
 
     match event {
         FleetEvent::BridgeReady { result, .. } => {
             state.instances[index].bridge_connecting = false;
-            match result {
+            let changed = match result {
                 Ok(bridge) => {
                     let client_socket = bridge.client_socket().to_path_buf();
                     let api_target =
                         ConnectionTarget::SocketPath(bridge.api_socket().to_path_buf());
+                    state.instances[index].bridge_status = Some(bridge.status());
                     state.instances[index].client_socket = Some(client_socket);
                     state.instances[index].api_target = Some(api_target.clone());
                     state.instances[index].request_tx =
@@ -800,20 +828,67 @@ fn handle_fleet_event(
                     );
                     state.instances[index].error = None;
                     state.bridges.push(bridge);
+                    true
                 }
-                Err(err) => state.instances[index].error = Some(err),
+                Err(err) => {
+                    let changed = state.instances[index].error.as_deref() != Some(err.as_str());
+                    state.instances[index].error = Some(err);
+                    changed
+                }
+            };
+            if changed {
+                state.host.request_repaint();
             }
-            state.host.request_repaint();
-            true
+            (changed, changed)
+        }
+        FleetEvent::ContentReady { result, .. } => {
+            state.instances[index].content_connecting = false;
+            let changed = match result {
+                Ok(writer) => match writer.try_clone() {
+                    Ok(reader) => {
+                        spawn_server_reader(
+                            state.instances[index].id.clone(),
+                            reader,
+                            event_tx.clone(),
+                            should_quit.clone(),
+                            state.host.kitty_graphics_enabled,
+                        );
+                        state.instances[index].writer = Some(writer);
+                        state.instances[index].error = None;
+                        true
+                    }
+                    Err(err) => {
+                        let error = err.to_string();
+                        let changed =
+                            state.instances[index].error.as_deref() != Some(error.as_str());
+                        state.instances[index].error = Some(error);
+                        changed
+                    }
+                },
+                Err(error) => {
+                    let error = state.instances[index]
+                        .bridge_status
+                        .as_ref()
+                        .and_then(crate::remote::FleetRemoteBridgeStatus::client_error)
+                        .unwrap_or(error);
+                    let changed = state.instances[index].error.as_deref() != Some(error.as_str());
+                    state.instances[index].error = Some(error);
+                    changed
+                }
+            };
+            if changed {
+                state.host.request_repaint();
+            }
+            (changed, changed)
         }
         FleetEvent::ServerMessage { message, .. } => match message {
             ServerMessage::Frame(frame) => {
                 state.instances[index].frame = Some(frame);
-                false
+                (false, true)
             }
             ServerMessage::Terminal(_) | ServerMessage::Graphics { .. } => {
                 tracing::debug!(instance = %state.instances[index].id, "ignored non-semantic fleet frame");
-                false
+                (false, false)
             }
             ServerMessage::Notify {
                 kind,
@@ -821,20 +896,23 @@ fn handle_fleet_event(
                 body,
             } => {
                 super::handle_notify(kind, &message, body.as_deref(), &state.host.sound_config);
-                false
+                (false, false)
             }
             ServerMessage::Clipboard { data } if index == state.active => {
                 super::forward_clipboard(&data);
-                false
+                (false, false)
             }
             ServerMessage::WindowTitle { title } if index == state.active => {
                 state.instances[index].window_title = title.clone();
-                super::write_window_title(title.as_deref());
-                false
+                let _ = crate::terminal_effects::write_window_title(
+                    &mut io::stdout(),
+                    title.as_deref(),
+                );
+                (false, false)
             }
             ServerMessage::WindowTitle { title } => {
                 state.instances[index].window_title = title;
-                false
+                (false, false)
             }
             ServerMessage::ReloadSoundConfig => {
                 super::reload_local_client_config(
@@ -844,55 +922,68 @@ fn handle_fleet_event(
                     &mut state.host.remote_image_paste_key,
                 );
                 reload_fleet_visual_config(state);
-                true
+                (true, true)
             }
-            ServerMessage::MouseCapture { enabled } => {
+            ServerMessage::MouseCapture {
+                enabled,
+                sgr_pixels,
+            } => {
                 state.instances[index].mouse_capture = enabled;
+                state.instances[index].mouse_sgr_pixels = enabled && sgr_pixels;
                 if index == state.active {
                     let _ = apply_active_host_modes(state);
                 }
-                false
+                (false, false)
             }
             ServerMessage::KittyKeyboardReportAll { enabled } => {
                 state.instances[index].keyboard_report_all = enabled;
                 if index == state.active {
                     let _ = apply_active_host_modes(state);
                 }
-                false
+                (false, false)
             }
             ServerMessage::PrefixInputSource { active } => {
                 state.instances[index].prefix_input_active = active;
                 if index == state.active {
                     apply_active_prefix_input_source(state);
                 }
-                false
+                (false, false)
             }
             ServerMessage::ServerShutdown { reason } => {
                 state.instances[index].error =
                     Some(reason.unwrap_or_else(|| "server shut down".to_string()));
+                state.instances[index].content_connecting = false;
                 state.instances[index].writer = None;
                 state.instances[index].frame = None;
-                true
+                (true, true)
             }
-            _ => false,
+            _ => (false, false),
         },
         FleetEvent::Disconnected { .. } => {
             state.instances[index].error = Some("disconnected".to_string());
+            state.instances[index].content_connecting = false;
             state.instances[index].writer = None;
             state.instances[index].frame = None;
-            true
+            (true, true)
         }
         FleetEvent::Snapshot { result, .. } => match result {
             Ok(snapshot) => {
                 let changed = state.instances[index].snapshot.as_ref() != Some(&snapshot);
                 state.instances[index].snapshot = Some(snapshot);
-                state.instances[index].error = None;
-                changed
+                if state.instances[index].writer.is_some() {
+                    state.instances[index].error = None;
+                }
+                (changed, changed)
             }
             Err(error) => {
+                let error = state.instances[index]
+                    .bridge_status
+                    .as_ref()
+                    .and_then(crate::remote::FleetRemoteBridgeStatus::api_error)
+                    .unwrap_or(error);
                 let changed = state.instances[index].error.as_deref() != Some(error.as_str());
                 state.instances[index].error = Some(error);
-                changed
+                (changed, changed)
             }
         },
     }
@@ -900,12 +991,19 @@ fn handle_fleet_event(
 
 fn apply_active_host_modes(state: &mut FleetState) -> Result<(), ClientError> {
     let desired_mouse = state.instances[state.active].mouse_capture;
-    if desired_mouse != state.host.mouse_capture_active {
-        super::set_mouse_capture(desired_mouse).map_err(ClientError::ConnectionFailed)?;
+    let desired_sgr_pixels = desired_mouse && state.instances[state.active].mouse_sgr_pixels;
+    if desired_mouse != state.host.mouse_capture_active
+        || desired_sgr_pixels != state.host_sgr_pixels.load(Ordering::Acquire)
+    {
+        super::set_mouse_capture(desired_mouse, desired_sgr_pixels)
+            .map_err(ClientError::ConnectionFailed)?;
         state.host.mouse_capture_active = desired_mouse;
         state
             .host_mouse_capture
             .store(desired_mouse, Ordering::Release);
+        state
+            .host_sgr_pixels
+            .store(desired_sgr_pixels, Ordering::Release);
     }
     let desired_keyboard = state.instances[state.active].keyboard_report_all;
     if desired_keyboard != state.host.keyboard_report_all_active {
@@ -1269,6 +1367,7 @@ fn mark_content_stream_disconnected(state: &mut FleetState, index: usize, err: i
     };
     tracing::debug!(instance = %instance.id, %err, "fleet content stream write failed");
     instance.error = Some("disconnected".to_string());
+    instance.content_connecting = false;
     instance.writer = None;
     instance.frame = None;
     state.host.request_repaint();
@@ -1567,7 +1666,10 @@ fn activate_sidebar_route(state: &mut FleetState, ws_idx: usize, route: Option<S
     }
     let _ = apply_active_host_modes(state);
     apply_active_prefix_input_source(state);
-    super::write_window_title(state.instances[index].window_title.as_deref());
+    let _ = crate::terminal_effects::write_window_title(
+        &mut io::stdout(),
+        state.instances[index].window_title.as_deref(),
+    );
 }
 
 fn request_for_active(state: &FleetState, id: &'static str, method: Method) {
@@ -1597,6 +1699,16 @@ fn render(state: &mut FleetState, cols: u16, rows: u16) {
         rows,
         content_rect,
     );
+    let connection_error = state.instances[state.active]
+        .writer
+        .is_none()
+        .then(|| {
+            state.instances[state.active]
+                .error
+                .as_ref()
+                .map(|error| (state.instances[state.active].name.clone(), error.clone()))
+        })
+        .flatten();
     let Some(base_buffer) = base.to_ratatui_buffer() else {
         return;
     };
@@ -1606,6 +1718,15 @@ fn render(state: &mut FleetState, cols: u16, rows: u16) {
     terminal
         .draw(|frame| {
             frame.buffer_mut().clone_from(&base_buffer);
+            if let Some((instance_name, error)) = &connection_error {
+                crate::ui::render_client_connection_error(
+                    frame,
+                    content_rect,
+                    instance_name,
+                    error,
+                    &state.sidebar.palette,
+                );
+            }
             crate::ui::render_client_shell(&state.sidebar, frame);
         })
         .expect("fleet shell render should not fail");
@@ -1755,10 +1876,11 @@ fn build_sidebar_state(
             .as_ref()
             .map(|snapshot| snapshot.workspaces.as_slice())
             .unwrap_or(&[]);
+        let connection_failed = instance.writer.is_none() && instance.error.is_some();
 
-        if snapshot_workspaces.is_empty() {
-            let status = if let Some(error) = &instance.error {
-                error.as_str()
+        if connection_failed || snapshot_workspaces.is_empty() {
+            let status = if connection_failed {
+                "offline"
             } else if instance.writer.is_some() {
                 "no spaces"
             } else {
@@ -1786,10 +1908,13 @@ fn build_sidebar_state(
                 0,
             );
             let ws_idx = app.workspaces.len();
-            app.terminals.insert(
-                terminal_id.clone(),
-                crate::terminal::TerminalState::new(terminal_id, "/".into()),
-            );
+            let mut terminal = crate::terminal::TerminalState::new(terminal_id.clone(), "/".into());
+            if connection_failed {
+                terminal.state = crate::detect::AgentState::Blocked;
+            } else if instance.bridge_connecting || instance.content_connecting {
+                terminal.state = crate::detect::AgentState::Working;
+            }
+            app.terminals.insert(terminal_id, terminal);
             app.workspaces.push(workspace);
             workspace_routes.insert(
                 ws_idx,
