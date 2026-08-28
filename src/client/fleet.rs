@@ -15,7 +15,7 @@ use super::{ClientError, ClientLoopEvent};
 use crate::api::client::{ApiClient, ConnectionTarget};
 use crate::api::schema::{
     AgentStatus, EmptyParams, Method, PaneTarget, Request, ResponseResult, SessionSnapshot,
-    TabTarget, WorkspaceCreateParams, WorkspaceRenameParams, WorkspaceTarget,
+    TabTarget, WorkspaceCloseParams, WorkspaceCreateParams, WorkspaceRenameParams, WorkspaceTarget,
 };
 use crate::ipc::LocalStream;
 use crate::platform::PrefixInputSource;
@@ -26,7 +26,8 @@ use crate::protocol::{
 };
 
 const LOCAL_INSTANCE_ID: &str = "local";
-const RECONNECT_INTERVAL: Duration = Duration::from_millis(750);
+const RECONNECT_INITIAL_DELAY: Duration = Duration::from_millis(750);
+const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 
 pub(super) fn is_enabled() -> bool {
     crate::fleet::load().enabled_instances().next().is_some()
@@ -41,10 +42,15 @@ struct Instance {
     content_connecting: bool,
     bridge_status: Option<crate::remote::FleetRemoteBridgeStatus>,
     writer: Option<LocalStream>,
+    content_generation: u64,
     api_target: Option<ConnectionTarget>,
+    api_connected: bool,
     snapshot: Option<SessionSnapshot>,
     frame: Option<FrameData>,
     error: Option<String>,
+    action_error: Option<String>,
+    retry_at: Instant,
+    retry_delay: Duration,
     mouse_capture: bool,
     mouse_sgr_pixels: bool,
     keyboard_report_all: bool,
@@ -55,7 +61,8 @@ struct Instance {
 }
 
 struct ApiCommand {
-    id: &'static str,
+    id: String,
+    label: String,
     method: Method,
 }
 
@@ -66,18 +73,31 @@ enum FleetEvent {
     },
     ContentReady {
         instance_id: String,
+        generation: u64,
         result: Result<LocalStream, String>,
     },
     ServerMessage {
         instance_id: String,
+        generation: u64,
         message: ServerMessage,
     },
     Disconnected {
         instance_id: String,
+        generation: u64,
     },
     Snapshot {
         instance_id: String,
         result: Result<SessionSnapshot, String>,
+    },
+    ApiResult {
+        instance_id: String,
+        label: String,
+        result: Result<(), String>,
+    },
+    AgentStatusChanged {
+        instance_id: String,
+        event: crate::api::schema::PaneAgentStatusChangedEvent,
+        previous_status: AgentStatus,
     },
 }
 
@@ -107,7 +127,6 @@ struct FleetState {
     pending_prefix_bytes: Vec<u8>,
     cell_width_px: u32,
     cell_height_px: u32,
-    last_reconnect_attempt: Instant,
     visual: FleetVisualConfig,
 }
 
@@ -201,7 +220,7 @@ pub(super) fn run() -> io::Result<()> {
     let content = sidebar.view.terminal_area;
     let content_cols = content.width.max(2);
     let content_rows = content.height.max(1);
-    let mut bridges = Vec::new();
+    let bridges = Vec::new();
     let mut instances = Vec::new();
     instances.push(Instance {
         id: LOCAL_INSTANCE_ID.to_string(),
@@ -212,10 +231,15 @@ pub(super) fn run() -> io::Result<()> {
         content_connecting: false,
         bridge_status: None,
         writer: None,
+        content_generation: 0,
         api_target: Some(ConnectionTarget::LocalSession(crate::session::active_name())),
+        api_connected: false,
         snapshot: None,
         frame: None,
         error: None,
+        action_error: None,
+        retry_at: Instant::now(),
+        retry_delay: RECONNECT_INITIAL_DELAY,
         mouse_capture,
         mouse_sgr_pixels: false,
         keyboard_report_all: false,
@@ -226,7 +250,7 @@ pub(super) fn run() -> io::Result<()> {
     });
 
     for definition in registry.enabled_instances() {
-        let mut instance = Instance {
+        let instance = Instance {
             id: definition.id.as_str().to_string(),
             name: definition.name.clone(),
             remote_target: Some(definition.target.clone()),
@@ -235,10 +259,15 @@ pub(super) fn run() -> io::Result<()> {
             content_connecting: false,
             bridge_status: None,
             writer: None,
+            content_generation: 0,
             api_target: None,
+            api_connected: false,
             snapshot: None,
             frame: None,
             error: None,
+            action_error: None,
+            retry_at: Instant::now(),
+            retry_delay: RECONNECT_INITIAL_DELAY,
             mouse_capture,
             mouse_sgr_pixels: false,
             keyboard_report_all: false,
@@ -247,21 +276,6 @@ pub(super) fn run() -> io::Result<()> {
             request_tx: None,
             client_socket: None,
         };
-        match crate::remote::start_fleet_remote_bridge(
-            &definition.target,
-            definition.session.as_deref(),
-            definition.id.as_str(),
-        ) {
-            Ok(bridge) => {
-                let client_socket = bridge.client_socket().to_path_buf();
-                let api_socket = bridge.api_socket().to_path_buf();
-                instance.bridge_status = Some(bridge.status());
-                instance.api_target = Some(ConnectionTarget::SocketPath(api_socket));
-                instance.client_socket = Some(client_socket);
-                bridges.push(bridge);
-            }
-            Err(err) => instance.error = Some(err.to_string()),
-        }
         instances.push(instance);
     }
 
@@ -409,6 +423,7 @@ async fn run_loop(
             let read_stream = writer.try_clone().map_err(ClientError::ConnectionFailed)?;
             spawn_server_reader(
                 instance.id.clone(),
+                instance.content_generation,
                 read_stream,
                 fleet_tx.clone(),
                 should_quit.clone(),
@@ -416,7 +431,12 @@ async fn run_loop(
             );
         }
         if let Some(target) = instance.api_target.clone() {
-            instance.request_tx = Some(spawn_api_worker(target.clone(), should_quit.clone()));
+            instance.request_tx = Some(spawn_api_worker(
+                instance.id.clone(),
+                target.clone(),
+                fleet_tx.clone(),
+                should_quit.clone(),
+            ));
             spawn_snapshot_watcher(
                 instance.id.clone(),
                 target,
@@ -463,7 +483,6 @@ async fn run_loop(
         pending_prefix_bytes: Vec::new(),
         cell_width_px: initial_cell_width_px,
         cell_height_px: initial_cell_height_px,
-        last_reconnect_attempt: Instant::now(),
         visual,
     };
     let mut current_cols = cols;
@@ -517,24 +536,32 @@ async fn run_loop(
     Ok(())
 }
 
+fn schedule_instance_retry(instance: &mut Instance) {
+    instance.retry_at = Instant::now() + instance.retry_delay;
+    instance.retry_delay = instance
+        .retry_delay
+        .saturating_mul(2)
+        .min(RECONNECT_MAX_DELAY);
+}
+
+fn reset_instance_retry(instance: &mut Instance) {
+    instance.retry_at = Instant::now();
+    instance.retry_delay = RECONNECT_INITIAL_DELAY;
+}
+
 fn reconnect_content_streams(
     state: &mut FleetState,
     cols: u16,
     rows: u16,
     event_tx: &tokio::sync::mpsc::Sender<FleetEvent>,
 ) {
-    if state.last_reconnect_attempt.elapsed() < RECONNECT_INTERVAL {
-        return;
-    }
-    state.last_reconnect_attempt = Instant::now();
     update_sidebar_geometry(state, cols, rows);
     let content = state.sidebar.view.terminal_area;
-    for instance in &mut state.instances {
-        if instance.writer.is_some() || instance.content_connecting {
-            continue;
-        }
+    let active = state.active;
+
+    for (index, instance) in state.instances.iter_mut().enumerate() {
         if instance.client_socket.is_none() {
-            if instance.bridge_connecting {
+            if instance.bridge_connecting || Instant::now() < instance.retry_at {
                 continue;
             }
             let Some(target) = instance.remote_target.clone() else {
@@ -558,6 +585,14 @@ fn reconnect_content_streams(
             });
             continue;
         }
+
+        if index != active
+            || instance.writer.is_some()
+            || instance.content_connecting
+            || Instant::now() < instance.retry_at
+        {
+            continue;
+        }
         let Some(socket) = instance.client_socket.clone() else {
             continue;
         };
@@ -567,6 +602,8 @@ fn reconnect_content_streams(
         let content_rows = content.height.max(1);
         let cell_width_px = state.cell_width_px;
         let cell_height_px = state.cell_height_px;
+        instance.content_generation = instance.content_generation.wrapping_add(1);
+        let generation = instance.content_generation;
         instance.content_connecting = true;
         std::thread::spawn(move || {
             let result = connect_app(
@@ -579,6 +616,7 @@ fn reconnect_content_streams(
             .map_err(|err| err.to_string());
             let _ = content_tx.blocking_send(FleetEvent::ContentReady {
                 instance_id,
+                generation,
                 result,
             });
         });
@@ -586,7 +624,9 @@ fn reconnect_content_streams(
 }
 
 fn spawn_api_worker(
+    instance_id: String,
     target: ConnectionTarget,
+    event_tx: tokio::sync::mpsc::Sender<FleetEvent>,
     should_quit: Arc<AtomicBool>,
 ) -> std::sync::mpsc::Sender<ApiCommand> {
     let (tx, rx) = std::sync::mpsc::channel::<ApiCommand>();
@@ -596,11 +636,25 @@ fn spawn_api_worker(
             let Ok(command) = rx.recv_timeout(Duration::from_millis(100)) else {
                 continue;
             };
-            if let Err(err) = client.request(Request {
-                id: command.id.to_string(),
-                method: command.method,
-            }) {
-                tracing::warn!(id = command.id, err = %err, "fleet API command failed");
+            let result = client
+                .request(Request {
+                    id: command.id.to_string(),
+                    method: command.method,
+                })
+                .map(|_| ())
+                .map_err(|err| err.to_string());
+            if let Err(err) = &result {
+                tracing::warn!(id = command.id, %err, "fleet API command failed");
+            }
+            if event_tx
+                .blocking_send(FleetEvent::ApiResult {
+                    instance_id: instance_id.clone(),
+                    label: command.label,
+                    result,
+                })
+                .is_err()
+            {
+                return;
             }
         }
     });
@@ -609,6 +663,7 @@ fn spawn_api_worker(
 
 fn spawn_server_reader(
     instance_id: String,
+    generation: u64,
     mut stream: LocalStream,
     event_tx: tokio::sync::mpsc::Sender<FleetEvent>,
     should_quit: Arc<AtomicBool>,
@@ -627,6 +682,7 @@ fn spawn_server_reader(
                     if event_tx
                         .blocking_send(FleetEvent::ServerMessage {
                             instance_id: instance_id.clone(),
+                            generation,
                             message,
                         })
                         .is_err()
@@ -635,12 +691,26 @@ fn spawn_server_reader(
                     }
                 }
                 Err(_) => {
-                    let _ = event_tx.blocking_send(FleetEvent::Disconnected { instance_id });
+                    let _ = event_tx.blocking_send(FleetEvent::Disconnected {
+                        instance_id,
+                        generation,
+                    });
                     return;
                 }
             }
         }
     });
+}
+
+#[derive(Clone)]
+struct PaneWatchState {
+    pane_id: String,
+    status: AgentStatus,
+}
+
+struct SnapshotWatch {
+    panes: Vec<PaneWatchState>,
+    connected: bool,
 }
 
 fn spawn_snapshot_watcher(
@@ -650,14 +720,27 @@ fn spawn_snapshot_watcher(
     should_quit: Arc<AtomicBool>,
 ) {
     std::thread::spawn(move || {
+        let mut retry_delay = RECONNECT_INITIAL_DELAY;
         while !should_quit.load(Ordering::Acquire) {
             let client = ApiClient::for_target(target.clone());
-            let pane_ids = match send_snapshot(&instance_id, &client, &event_tx) {
-                Ok(pane_ids) => pane_ids,
+            let snapshot = match send_snapshot(&instance_id, &client, &event_tx) {
+                Ok(snapshot) => snapshot,
                 Err(()) => return,
             };
-            let result =
-                watch_instance_events(&instance_id, &client, &event_tx, &should_quit, &pane_ids);
+            if !snapshot.connected {
+                std::thread::sleep(retry_delay);
+                retry_delay = retry_delay.saturating_mul(2).min(RECONNECT_MAX_DELAY);
+                continue;
+            }
+            retry_delay = RECONNECT_INITIAL_DELAY;
+
+            let result = watch_instance_events(
+                &instance_id,
+                &client,
+                &event_tx,
+                &should_quit,
+                &snapshot.panes,
+            );
             if should_quit.load(Ordering::Acquire) {
                 return;
             }
@@ -671,7 +754,8 @@ fn spawn_snapshot_watcher(
                     });
                 }
             }
-            std::thread::sleep(RECONNECT_INTERVAL);
+            std::thread::sleep(retry_delay);
+            retry_delay = retry_delay.saturating_mul(2).min(RECONNECT_MAX_DELAY);
         }
     });
 }
@@ -680,7 +764,7 @@ fn send_snapshot(
     instance_id: &str,
     client: &ApiClient,
     event_tx: &tokio::sync::mpsc::Sender<FleetEvent>,
-) -> Result<Vec<String>, ()> {
+) -> Result<SnapshotWatch, ()> {
     let result = client
         .request(Request {
             id: format!("fleet-snapshot:{instance_id}"),
@@ -693,24 +777,28 @@ fn send_snapshot(
             )),
         })
         .map_err(|err| err.to_string());
-    let mut pane_ids: Vec<String> = result
+    let connected = result.is_ok();
+    let mut panes = result
         .as_ref()
         .map(|snapshot| {
             snapshot
                 .panes
                 .iter()
-                .map(|pane| pane.pane_id.clone())
-                .collect()
+                .map(|pane| PaneWatchState {
+                    pane_id: pane.pane_id.clone(),
+                    status: pane.agent_status,
+                })
+                .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    pane_ids.sort();
+    panes.sort_by(|left, right| left.pane_id.cmp(&right.pane_id));
     event_tx
         .blocking_send(FleetEvent::Snapshot {
             instance_id: instance_id.to_string(),
             result,
         })
         .map_err(|_| ())?;
-    Ok(pane_ids)
+    Ok(SnapshotWatch { panes, connected })
 }
 
 fn watch_instance_events(
@@ -718,9 +806,11 @@ fn watch_instance_events(
     client: &ApiClient,
     event_tx: &tokio::sync::mpsc::Sender<FleetEvent>,
     should_quit: &AtomicBool,
-    pane_ids: &[String],
+    pane_states: &[PaneWatchState],
 ) -> Result<bool, String> {
-    use crate::api::schema::{EventsSubscribeParams, Subscription};
+    use crate::api::schema::{
+        EventsSubscribeParams, Subscription, SubscriptionEventData, SubscriptionEventEnvelope,
+    };
 
     let mut stream =
         crate::ipc::connect_local_stream(&client.socket_path()).map_err(|err| err.to_string())?;
@@ -750,12 +840,14 @@ fn watch_instance_events(
         Subscription::PaneAgentDetected {},
         Subscription::LayoutUpdated {},
     ];
-    subscriptions.extend(pane_ids.iter().cloned().map(|pane_id| {
-        Subscription::PaneAgentStatusChanged {
-            pane_id,
-            agent_status: None,
-        }
-    }));
+    subscriptions.extend(
+        pane_states
+            .iter()
+            .map(|pane| Subscription::PaneAgentStatusChanged {
+                pane_id: pane.pane_id.clone(),
+                agent_status: None,
+            }),
+    );
     let request = Request {
         id: format!("fleet-events:{instance_id}"),
         method: Method::EventsSubscribe(EventsSubscribeParams { subscriptions }),
@@ -764,6 +856,14 @@ fn watch_instance_events(
     stream.write_all(&encoded).map_err(|err| err.to_string())?;
     stream.write_all(b"\n").map_err(|err| err.to_string())?;
     stream.flush().map_err(|err| err.to_string())?;
+    let mut last_status = pane_states
+        .iter()
+        .map(|pane| (pane.pane_id.clone(), pane.status))
+        .collect::<HashMap<_, _>>();
+    let pane_ids = pane_states
+        .iter()
+        .map(|pane| pane.pane_id.as_str())
+        .collect::<Vec<_>>();
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     while !should_quit.load(Ordering::Acquire) {
@@ -771,11 +871,37 @@ fn watch_instance_events(
         match reader.read_line(&mut line) {
             Ok(0) => return Err("event stream disconnected".to_string()),
             Ok(_) => {
-                let updated_pane_ids = match send_snapshot(instance_id, client, event_tx) {
-                    Ok(pane_ids) => pane_ids,
+                if let Ok(subscription_event) =
+                    serde_json::from_str::<SubscriptionEventEnvelope>(&line)
+                {
+                    if let SubscriptionEventData::PaneAgentStatusChanged(event) =
+                        subscription_event.data
+                    {
+                        if let Some(previous_status) =
+                            last_status.insert(event.pane_id.clone(), event.agent_status)
+                        {
+                            if previous_status != event.agent_status {
+                                let _ = event_tx.blocking_send(FleetEvent::AgentStatusChanged {
+                                    instance_id: instance_id.to_string(),
+                                    event,
+                                    previous_status,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                let updated = match send_snapshot(instance_id, client, event_tx) {
+                    Ok(snapshot) if snapshot.connected => snapshot,
+                    Ok(_) => return Err("snapshot refresh failed".to_string()),
                     Err(()) => return Ok(false),
                 };
-                if updated_pane_ids != pane_ids {
+                let updated_ids = updated
+                    .panes
+                    .iter()
+                    .map(|pane| pane.pane_id.as_str())
+                    .collect::<Vec<_>>();
+                if updated_ids != pane_ids {
                     return Ok(true);
                 }
             }
@@ -796,8 +922,10 @@ fn handle_fleet_event(
         FleetEvent::BridgeReady { instance_id, .. }
         | FleetEvent::ContentReady { instance_id, .. }
         | FleetEvent::ServerMessage { instance_id, .. }
-        | FleetEvent::Disconnected { instance_id }
-        | FleetEvent::Snapshot { instance_id, .. } => instance_id,
+        | FleetEvent::Disconnected { instance_id, .. }
+        | FleetEvent::Snapshot { instance_id, .. }
+        | FleetEvent::ApiResult { instance_id, .. }
+        | FleetEvent::AgentStatusChanged { instance_id, .. } => instance_id,
     };
     let Some(index) = state
         .instances
@@ -806,6 +934,18 @@ fn handle_fleet_event(
     else {
         return (false, false);
     };
+
+    let event_generation = match &event {
+        FleetEvent::ContentReady { generation, .. }
+        | FleetEvent::ServerMessage { generation, .. }
+        | FleetEvent::Disconnected { generation, .. } => Some(*generation),
+        _ => None,
+    };
+    if event_generation
+        .is_some_and(|generation| generation != state.instances[index].content_generation)
+    {
+        return (false, false);
+    }
 
     match event {
         FleetEvent::BridgeReady { result, .. } => {
@@ -818,8 +958,12 @@ fn handle_fleet_event(
                     state.instances[index].bridge_status = Some(bridge.status());
                     state.instances[index].client_socket = Some(client_socket);
                     state.instances[index].api_target = Some(api_target.clone());
-                    state.instances[index].request_tx =
-                        Some(spawn_api_worker(api_target.clone(), should_quit.clone()));
+                    state.instances[index].request_tx = Some(spawn_api_worker(
+                        state.instances[index].id.clone(),
+                        api_target.clone(),
+                        event_tx.clone(),
+                        should_quit.clone(),
+                    ));
                     spawn_snapshot_watcher(
                         state.instances[index].id.clone(),
                         api_target,
@@ -827,12 +971,14 @@ fn handle_fleet_event(
                         should_quit.clone(),
                     );
                     state.instances[index].error = None;
+                    reset_instance_retry(&mut state.instances[index]);
                     state.bridges.push(bridge);
                     true
                 }
                 Err(err) => {
                     let changed = state.instances[index].error.as_deref() != Some(err.as_str());
                     state.instances[index].error = Some(err);
+                    schedule_instance_retry(&mut state.instances[index]);
                     changed
                 }
             };
@@ -841,13 +987,16 @@ fn handle_fleet_event(
             }
             (changed, changed)
         }
-        FleetEvent::ContentReady { result, .. } => {
+        FleetEvent::ContentReady {
+            generation, result, ..
+        } => {
             state.instances[index].content_connecting = false;
             let changed = match result {
                 Ok(writer) => match writer.try_clone() {
                     Ok(reader) => {
                         spawn_server_reader(
                             state.instances[index].id.clone(),
+                            generation,
                             reader,
                             event_tx.clone(),
                             should_quit.clone(),
@@ -855,6 +1004,8 @@ fn handle_fleet_event(
                         );
                         state.instances[index].writer = Some(writer);
                         state.instances[index].error = None;
+                        reset_instance_retry(&mut state.instances[index]);
+                        super::query_host_terminal_theme();
                         true
                     }
                     Err(err) => {
@@ -862,6 +1013,7 @@ fn handle_fleet_event(
                         let changed =
                             state.instances[index].error.as_deref() != Some(error.as_str());
                         state.instances[index].error = Some(error);
+                        schedule_instance_retry(&mut state.instances[index]);
                         changed
                     }
                 },
@@ -873,6 +1025,7 @@ fn handle_fleet_event(
                         .unwrap_or(error);
                     let changed = state.instances[index].error.as_deref() != Some(error.as_str());
                     state.instances[index].error = Some(error);
+                    schedule_instance_retry(&mut state.instances[index]);
                     changed
                 }
             };
@@ -952,9 +1105,12 @@ fn handle_fleet_event(
             ServerMessage::ServerShutdown { reason } => {
                 state.instances[index].error =
                     Some(reason.unwrap_or_else(|| "server shut down".to_string()));
+                state.instances[index].content_generation =
+                    state.instances[index].content_generation.wrapping_add(1);
                 state.instances[index].content_connecting = false;
                 state.instances[index].writer = None;
                 state.instances[index].frame = None;
+                schedule_instance_retry(&mut state.instances[index]);
                 (true, true)
             }
             _ => (false, false),
@@ -964,18 +1120,22 @@ fn handle_fleet_event(
             state.instances[index].content_connecting = false;
             state.instances[index].writer = None;
             state.instances[index].frame = None;
+            schedule_instance_retry(&mut state.instances[index]);
             (true, true)
         }
         FleetEvent::Snapshot { result, .. } => match result {
             Ok(snapshot) => {
-                let changed = state.instances[index].snapshot.as_ref() != Some(&snapshot);
+                let changed = state.instances[index].snapshot.as_ref() != Some(&snapshot)
+                    || !state.instances[index].api_connected;
                 state.instances[index].snapshot = Some(snapshot);
-                if state.instances[index].writer.is_some() {
+                state.instances[index].api_connected = true;
+                if state.instances[index].writer.is_some() || index != state.active {
                     state.instances[index].error = None;
                 }
                 (changed, changed)
             }
             Err(error) => {
+                state.instances[index].api_connected = false;
                 let error = state.instances[index]
                     .bridge_status
                     .as_ref()
@@ -986,6 +1146,114 @@ fn handle_fleet_event(
                 (changed, changed)
             }
         },
+        FleetEvent::ApiResult { label, result, .. } => {
+            let next_error = result.err().map(|error| format!("{label}: {error}"));
+            let changed = state.instances[index].action_error != next_error;
+            state.instances[index].action_error = next_error;
+            if changed {
+                state.host.request_repaint();
+            }
+            (false, changed)
+        }
+        FleetEvent::AgentStatusChanged {
+            event,
+            previous_status,
+            ..
+        } => {
+            handle_background_agent_status_change(state, index, event, previous_status);
+            (false, false)
+        }
+    }
+}
+
+fn handle_background_agent_status_change(
+    state: &mut FleetState,
+    index: usize,
+    event: crate::api::schema::PaneAgentStatusChangedEvent,
+    previous_status: AgentStatus,
+) {
+    if index == state.active || state.visual.toast.delay_seconds != 0 {
+        return;
+    }
+
+    let previous_state = native_agent_state(previous_status).0;
+    let next_state = native_agent_state(event.agent_status).0;
+    let agent_label = event
+        .display_agent
+        .as_deref()
+        .or(event.agent.as_deref())
+        .unwrap_or("agent");
+    let known_agent = event
+        .agent
+        .as_deref()
+        .and_then(crate::detect::parse_agent_label);
+
+    if state.host.sound_config.allows(known_agent) {
+        if let Some(sound) =
+            crate::app::actions::notification_sound_for_state_change_with_agent_labels(
+                false,
+                previous_state,
+                next_state,
+                event.agent.as_deref(),
+                event.agent.as_deref(),
+            )
+        {
+            crate::sound::play(sound, &state.host.sound_config);
+        }
+    }
+
+    let Some(kind) = crate::app::actions::notification_toast_for_state_change_with_agent_labels(
+        false,
+        previous_state,
+        next_state,
+        event.agent.as_deref(),
+        event.agent.as_deref(),
+    ) else {
+        return;
+    };
+    let event_text = match kind {
+        crate::app::state::ToastKind::NeedsAttention => "needs attention",
+        crate::app::state::ToastKind::Finished => "finished",
+        crate::app::state::ToastKind::UpdateInstalled => "updated",
+    };
+    let workspace_label = state.instances[index]
+        .snapshot
+        .as_ref()
+        .and_then(|snapshot| {
+            snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == event.workspace_id)
+        })
+        .map(|workspace| workspace.label.as_str())
+        .unwrap_or("workspace");
+    let title = format!("{agent_label} {event_text}");
+    let context = format!("{} · {workspace_label}", state.instances[index].name);
+
+    match state.visual.toast.delivery {
+        crate::config::ToastDelivery::Off => {}
+        crate::config::ToastDelivery::Herdr => {
+            state.sidebar.toast = Some(crate::app::state::ToastNotification {
+                kind,
+                title,
+                context,
+                position: None,
+                target: None,
+            });
+            state.host.request_repaint();
+        }
+        crate::config::ToastDelivery::Terminal => super::handle_notify(
+            crate::protocol::NotifyKind::Toast,
+            &title,
+            Some(&context),
+            &state.host.sound_config,
+        ),
+        crate::config::ToastDelivery::System => super::handle_notify(
+            crate::protocol::NotifyKind::SystemToast,
+            &title,
+            Some(&context),
+            &state.host.sound_config,
+        ),
     }
 }
 
@@ -1221,24 +1489,12 @@ fn persist_fleet_presentation(state: &mut FleetState) {
 }
 
 fn broadcast_input(state: &mut FleetState, data: &[u8]) -> Result<(), ClientError> {
-    let mut disconnected = Vec::new();
-    for (index, instance) in state.instances.iter_mut().enumerate() {
-        let Some(writer) = &mut instance.writer else {
-            continue;
-        };
-        if let Err(err) = super::write_to_server(
-            writer,
-            &ClientMessage::Input {
-                data: data.to_vec(),
-            },
-        ) {
-            disconnected.push((index, err));
-        }
-    }
-    for (index, err) in disconnected {
-        mark_content_stream_disconnected(state, index, err);
-    }
-    Ok(())
+    write_active(
+        state,
+        ClientMessage::Input {
+            data: data.to_vec(),
+        },
+    )
 }
 
 fn flush_active_input(state: &mut FleetState, data: &mut Vec<u8>) -> Result<(), ClientError> {
@@ -1313,25 +1569,20 @@ fn resize_content_streams(state: &mut FleetState, cols: u16, rows: u16) -> Resul
     let content = state.sidebar.view.terminal_area;
     let content_cols = content.width.max(2);
     let content_rows = content.height.max(1);
-    let mut disconnected = Vec::new();
-    for (index, instance) in state.instances.iter_mut().enumerate() {
-        instance.frame = None;
-        if let Some(writer) = &mut instance.writer {
-            if let Err(err) = super::write_to_server(
-                writer,
-                &ClientMessage::Resize {
-                    cols: content_cols,
-                    rows: content_rows,
-                    cell_width_px: state.cell_width_px,
-                    cell_height_px: state.cell_height_px,
-                },
-            ) {
-                disconnected.push((index, err));
-            }
+    let index = state.active;
+    state.instances[index].frame = None;
+    if let Some(writer) = state.instances[index].writer.as_mut() {
+        if let Err(err) = super::write_to_server(
+            writer,
+            &ClientMessage::Resize {
+                cols: content_cols,
+                rows: content_rows,
+                cell_width_px: state.cell_width_px,
+                cell_height_px: state.cell_height_px,
+            },
+        ) {
+            mark_content_stream_disconnected(state, index, err);
         }
-    }
-    for (index, err) in disconnected {
-        mark_content_stream_disconnected(state, index, err);
     }
     Ok(())
 }
@@ -1367,9 +1618,11 @@ fn mark_content_stream_disconnected(state: &mut FleetState, index: usize, err: i
     };
     tracing::debug!(instance = %instance.id, %err, "fleet content stream write failed");
     instance.error = Some("disconnected".to_string());
+    instance.content_generation = instance.content_generation.wrapping_add(1);
     instance.content_connecting = false;
     instance.writer = None;
     instance.frame = None;
+    schedule_instance_retry(instance);
     state.host.request_repaint();
 }
 
@@ -1522,6 +1775,9 @@ fn dispatch_sidebar_action(state: &mut FleetState, action: crate::app::ClientSid
             }
         }
         crate::app::ClientSidebarAction::CloseWorkspace { ws_idx } => {
+            let close_group = state
+                .sidebar
+                .workspace_close_would_close_worktree_group(ws_idx);
             if let Some(SidebarHit::Workspace {
                 index,
                 workspace_id,
@@ -1531,7 +1787,10 @@ fn dispatch_sidebar_action(state: &mut FleetState, action: crate::app::ClientSid
                     state,
                     index,
                     "fleet-workspace-close",
-                    Method::WorkspaceClose(WorkspaceTarget { workspace_id }),
+                    Method::WorkspaceClose(WorkspaceCloseParams {
+                        workspace_id,
+                        close_group,
+                    }),
                 );
             }
         }
@@ -1639,6 +1898,18 @@ fn focus_pane_route(state: &mut FleetState, ws_idx: usize, pane_id: crate::layou
     activate_sidebar_route(state, ws_idx, route);
 }
 
+fn detach_instance_content(state: &mut FleetState, index: usize) {
+    let Some(instance) = state.instances.get_mut(index) else {
+        return;
+    };
+    if let Some(mut writer) = instance.writer.take() {
+        let _ = super::write_to_server(&mut writer, &ClientMessage::Detach);
+    }
+    instance.content_generation = instance.content_generation.wrapping_add(1);
+    instance.content_connecting = false;
+    instance.frame = None;
+}
+
 fn activate_sidebar_route(state: &mut FleetState, ws_idx: usize, route: Option<SidebarHit>) {
     let Some(route) = route else {
         return;
@@ -1657,7 +1928,15 @@ fn activate_sidebar_route(state: &mut FleetState, ws_idx: usize, route: Option<S
             (index, Some(Method::PaneFocus(PaneTarget { pane_id })))
         }
     };
-    state.active = index;
+    if state.active != index {
+        let previous = state.active;
+        detach_instance_content(state, previous);
+        state.active = index;
+        reset_instance_retry(&mut state.instances[index]);
+        super::query_host_terminal_theme();
+    } else if state.instances[index].writer.is_none() {
+        reset_instance_retry(&mut state.instances[index]);
+    }
     state.host.request_repaint();
     state.sidebar.active = Some(ws_idx);
     state.sidebar.selected = ws_idx;
@@ -1672,19 +1951,53 @@ fn activate_sidebar_route(state: &mut FleetState, ws_idx: usize, route: Option<S
     );
 }
 
-fn request_for_active(state: &FleetState, id: &'static str, method: Method) {
+fn api_command_label(id: &str) -> &str {
+    match id {
+        "fleet-workspace-create" => "create workspace",
+        "fleet-workspace-rename" => "rename workspace",
+        "fleet-workspace-close" => "close workspace",
+        "fleet-focus" => "focus target",
+        "fleet-reload-config" => "reload config",
+        _ => "fleet action",
+    }
+}
+
+fn request_for_active(state: &mut FleetState, id: &str, method: Method) {
     request_for_instance(state, state.active, id, method);
 }
 
-fn request_for_instance(state: &FleetState, index: usize, id: &'static str, method: Method) {
+fn request_for_instance(state: &mut FleetState, index: usize, id: &str, method: Method) {
     let Some(request_tx) = state
         .instances
         .get(index)
         .and_then(|instance| instance.request_tx.as_ref())
+        .cloned()
     else {
+        if let Some(instance) = state.instances.get_mut(index) {
+            instance.action_error = Some(format!(
+                "{}: instance API is not connected",
+                api_command_label(id)
+            ));
+        }
+        state.host.request_repaint();
         return;
     };
-    let _ = request_tx.send(ApiCommand { id, method });
+    if request_tx
+        .send(ApiCommand {
+            id: id.to_string(),
+            label: api_command_label(id).to_string(),
+            method,
+        })
+        .is_err()
+    {
+        if let Some(instance) = state.instances.get_mut(index) {
+            instance.action_error = Some(format!(
+                "{}: instance API worker stopped",
+                api_command_label(id)
+            ));
+        }
+        state.host.request_repaint();
+    }
 }
 
 fn render(state: &mut FleetState, cols: u16, rows: u16) {
@@ -1699,16 +2012,19 @@ fn render(state: &mut FleetState, cols: u16, rows: u16) {
         rows,
         content_rect,
     );
-    let connection_error = state.instances[state.active]
-        .writer
-        .is_none()
-        .then(|| {
-            state.instances[state.active]
-                .error
-                .as_ref()
-                .map(|error| (state.instances[state.active].name.clone(), error.clone()))
-        })
-        .flatten();
+    let active_instance = &state.instances[state.active];
+    let presentation_error = active_instance
+        .action_error
+        .as_ref()
+        .map(|error| (format!("{} action", active_instance.name), error.clone()))
+        .or_else(|| {
+            active_instance
+                .writer
+                .is_none()
+                .then(|| active_instance.error.clone())
+                .flatten()
+                .map(|error| (active_instance.name.clone(), error))
+        });
     let Some(base_buffer) = base.to_ratatui_buffer() else {
         return;
     };
@@ -1718,7 +2034,7 @@ fn render(state: &mut FleetState, cols: u16, rows: u16) {
     terminal
         .draw(|frame| {
             frame.buffer_mut().clone_from(&base_buffer);
-            if let Some((instance_name, error)) = &connection_error {
+            if let Some((instance_name, error)) = &presentation_error {
                 crate::ui::render_client_connection_error(
                     frame,
                     content_rect,
@@ -1876,12 +2192,13 @@ fn build_sidebar_state(
             .as_ref()
             .map(|snapshot| snapshot.workspaces.as_slice())
             .unwrap_or(&[]);
-        let connection_failed = instance.writer.is_none() && instance.error.is_some();
+        let connection_failed = !instance.api_connected && instance.error.is_some();
+        let stale = !instance.api_connected;
 
-        if connection_failed || snapshot_workspaces.is_empty() {
+        if snapshot_workspaces.is_empty() {
             let status = if connection_failed {
                 "offline"
-            } else if instance.writer.is_some() {
+            } else if instance.api_connected {
                 "no spaces"
             } else {
                 "connecting"
@@ -1970,9 +2287,13 @@ fn build_sidebar_state(
                         .agents
                         .iter()
                         .find(|agent| agent.pane_id == pane.pane_id);
-                    let (pane_state, seen) = native_agent_state(
-                        agent.map_or(pane.agent_status, |agent| agent.agent_status),
-                    );
+                    let (pane_state, seen) = if stale {
+                        (crate::detect::AgentState::Unknown, false)
+                    } else {
+                        native_agent_state(
+                            agent.map_or(pane.agent_status, |agent| agent.agent_status),
+                        )
+                    };
                     let mut terminal = crate::terminal::TerminalState::new(
                         terminal_id.clone(),
                         pane.foreground_cwd
@@ -2056,7 +2377,11 @@ fn build_sidebar_state(
                 let pane_id = *projected_pane_ids
                     .entry(projection_key)
                     .or_insert_with(crate::layout::PaneId::alloc);
-                let (workspace_state, seen) = native_agent_state(workspace_info.agent_status);
+                let (workspace_state, seen) = if stale {
+                    (crate::detect::AgentState::Unknown, false)
+                } else {
+                    native_agent_state(workspace_info.agent_status)
+                };
                 let mut terminal =
                     crate::terminal::TerminalState::new(terminal_id.clone(), "/".into());
                 terminal.state = workspace_state;
@@ -2071,7 +2396,11 @@ fn build_sidebar_state(
                 terminals.push((terminal_id, terminal));
             }
 
-            let label = format!("{} · {}", instance.name, workspace_info.label);
+            let label = if stale {
+                format!("{} · {} · offline", instance.name, workspace_info.label)
+            } else {
+                format!("{} · {}", instance.name, workspace_info.label)
+            };
             let (mut workspace, tab_pane_ids) =
                 crate::workspace::Workspace::sidebar_placeholder_with_tabs(
                     format!("fleet:{}:{}", instance.id, workspace_info.workspace_id),
@@ -2080,8 +2409,21 @@ fn build_sidebar_state(
                     placeholder_tabs,
                     active_tab_idx,
                 );
+            if let Some(worktree) = &workspace_info.worktree {
+                workspace.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+                    key: format!("fleet:{}:{}", instance.id, worktree.repo_key),
+                    label: worktree.repo_name.clone(),
+                    repo_root: worktree.repo_root.clone().into(),
+                    checkout_path: worktree.checkout_path.clone().into(),
+                    is_linked_worktree: worktree.is_linked_worktree,
+                });
+            }
             let mut workspace_tokens = workspace_info.tokens.clone();
             workspace_tokens.insert("host".to_string(), instance.name.clone());
+            workspace_tokens.insert(
+                "connection".to_string(),
+                if stale { "offline" } else { "connected" }.to_string(),
+            );
             patch_metadata_tokens(&mut workspace.metadata_tokens, &workspace_tokens);
 
             let ws_idx = app.workspaces.len();

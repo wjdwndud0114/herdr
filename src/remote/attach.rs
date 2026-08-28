@@ -1931,14 +1931,6 @@ impl FleetRemoteBridge {
     }
 }
 
-pub(crate) fn start_fleet_remote_bridge(
-    target: &str,
-    session: Option<&str>,
-    instance_id: &str,
-) -> io::Result<FleetRemoteBridge> {
-    start_fleet_remote_bridge_inner(target, session, instance_id, true)
-}
-
 pub(crate) fn retry_fleet_remote_bridge(
     target: &str,
     session: Option<&str>,
