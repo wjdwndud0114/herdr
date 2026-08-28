@@ -318,6 +318,7 @@ fn direct_eligibility_is_installed_with_the_client_connection() {
         keybindings: None,
         direct_attach_requested: false,
         direct_graphics: true,
+        app_surface: crate::protocol::AppSurface::Full,
         writer,
     }));
 

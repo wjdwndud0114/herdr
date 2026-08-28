@@ -6218,6 +6218,7 @@ mod tests {
             keybindings: None,
             direct_attach_requested: false,
             direct_graphics: true,
+            app_surface: crate::protocol::AppSurface::Full,
             writer: writer_a,
         }));
         assert!(server.clients[&1].direct_graphics);
@@ -6235,6 +6236,7 @@ mod tests {
             keybindings: None,
             direct_attach_requested: false,
             direct_graphics: false,
+            app_surface: crate::protocol::AppSurface::Full,
             writer: writer_b,
         }));
         assert!(!server.direct_graphics_available());
