@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ratatui::{
     buffer::Buffer,
@@ -14,6 +14,9 @@ struct AgentRow {
     pane_id: String,
     status: crate::api::schema::AgentStatus,
     focused: bool,
+    pinned: bool,
+    unread: bool,
+    dragged: bool,
     rows: Vec<Vec<crate::ui::ResolvedToken>>,
 }
 
@@ -49,12 +52,42 @@ pub(super) fn ordered_agent_pane_ids(
         .collect()
 }
 
+pub(super) fn ordered_agent_pane_ids_with_preferences(
+    snapshot: &ClientShellSnapshot,
+    sort: crate::config::AgentPanelSortConfig,
+    pinned: &HashSet<String>,
+    manual_order: &[String],
+) -> Vec<String> {
+    let mut ordered = ordered_agent_pane_ids(snapshot, sort);
+    let ranks = if sort == crate::config::AgentPanelSortConfig::Manual {
+        manual_order
+            .iter()
+            .enumerate()
+            .map(|(index, pane_id)| (pane_id.as_str(), index))
+            .collect::<HashMap<_, _>>()
+    } else {
+        HashMap::new()
+    };
+    ordered.sort_by_key(|pane_id| {
+        (
+            !pinned.contains(pane_id),
+            ranks.get(pane_id.as_str()).copied().unwrap_or(usize::MAX),
+        )
+    });
+    ordered
+}
+
 pub(super) fn render_agent_panel(
     buffer: &mut Buffer,
     area: Rect,
     snapshot: &ClientShellSnapshot,
     config: &ClientShellConfig,
     agent_scroll: &mut usize,
+    pinned_agents: &HashSet<String>,
+    unread_agents: &HashSet<String>,
+    agent_manual_order: &[String],
+    dragged_agent_id: Option<&str>,
+    agent_drop_insert_index: Option<usize>,
     hits: &mut ShellHitMap,
 ) {
     if area.height == 0 {
@@ -88,6 +121,7 @@ pub(super) fn render_agent_panel(
             .unwrap_or(match config.agent_panel_sort {
                 crate::config::AgentPanelSortConfig::Spaces => "grouped",
                 crate::config::AgentPanelSortConfig::Priority => "priority",
+                crate::config::AgentPanelSortConfig::Manual => "manual",
             });
     let sort_width = display_width(sort_label).min(area.width as usize) as u16;
     let sort_rect = Rect::new(
@@ -116,7 +150,14 @@ pub(super) fn render_agent_panel(
             .add_modifier(Modifier::BOLD),
     );
 
-    let rows = agent_rows(snapshot, config);
+    let rows = agent_rows(
+        snapshot,
+        config,
+        pinned_agents,
+        unread_agents,
+        agent_manual_order,
+        dragged_agent_id,
+    );
     let body = Rect::new(
         area.x,
         area.y.saturating_add(3),
@@ -173,7 +214,47 @@ pub(super) fn render_agent_panel(
         }
         let rect = Rect::new(body.x, y, content_width, height);
         hits.agents.push((rect, row.pane_id.clone()));
+        let pin_rect = Rect::new(rect.right().saturating_sub(2), rect.y, 2.min(rect.width), 1);
+        let unread_rect = Rect::new(rect.right().saturating_sub(4), rect.y, 2.min(rect.width), 1);
+        hits.agent_pins.push((pin_rect, row.pane_id.clone()));
+        hits.agent_unreads.push((unread_rect, row.pane_id.clone()));
         render_agent_row(buffer, rect, row, config);
+        if agent_drop_insert_index == Some(index) {
+            put_text(
+                buffer,
+                rect.x,
+                rect.y,
+                1,
+                "▸",
+                Style::default()
+                    .fg(config.palette.accent)
+                    .add_modifier(Modifier::BOLD),
+            );
+        }
+        put_text(
+            buffer,
+            unread_rect.right().saturating_sub(1),
+            unread_rect.y,
+            1,
+            if row.unread { "●" } else { "○" },
+            Style::default().fg(if row.unread {
+                config.palette.accent
+            } else {
+                config.palette.overlay0
+            }),
+        );
+        put_text(
+            buffer,
+            pin_rect.right().saturating_sub(1),
+            pin_rect.y,
+            1,
+            if row.pinned { "◆" } else { "◇" },
+            Style::default().fg(if row.pinned {
+                config.palette.accent
+            } else {
+                config.palette.overlay0
+            }),
+        );
         y = y
             .saturating_add(height)
             .saturating_add(if index + 1 < rows.len() {
@@ -190,81 +271,98 @@ pub(super) fn render_agent_panel(
     }
 }
 
-fn agent_rows(snapshot: &ClientShellSnapshot, config: &ClientShellConfig) -> Vec<AgentRow> {
-    ordered_agent_pane_ids(snapshot, config.agent_panel_sort)
-        .into_iter()
-        .filter_map(|pane_id| {
-            let agent = snapshot
-                .agents
-                .iter()
-                .find(|agent| agent.pane_id == pane_id)?;
-            let workspace = snapshot
-                .workspaces
-                .iter()
-                .find(|workspace| workspace.workspace_id == agent.workspace_id)?;
-            let tab = snapshot.tabs.iter().find(|tab| tab.tab_id == agent.tab_id);
-            let pane = snapshot
-                .panes
-                .iter()
-                .find(|pane| pane.pane_id == agent.pane_id);
-            let tab_count = snapshot
-                .tabs
-                .iter()
-                .filter(|candidate| candidate.workspace_id == agent.workspace_id)
-                .count();
-            let tab_label = tab
-                .filter(|tab| tab_count > 1 || tab.custom_label)
-                .map(|tab| tab.label.as_str());
-            let agent_label = agent
-                .display_agent
-                .as_deref()
-                .or(agent.name.as_deref())
-                .or(agent.agent.as_deref())
-                .or(agent.title.as_deref());
-            let labels = agent
-                .state_labels
-                .iter()
-                .cloned()
-                .collect::<HashMap<_, _>>();
-            let tokens = agent.tokens.iter().cloned().collect::<HashMap<_, _>>();
-            let state_text = labels
-                .get(status_text(agent.agent_status))
-                .map(String::as_str)
-                .unwrap_or_else(|| sidebar_status_text(agent.agent_status));
-            let canonical_agent = agent
-                .agent
-                .as_deref()
-                .and_then(crate::detect::parse_agent_label);
-            let rows = crate::ui::sidebar_agent_rows(
-                &config.agents,
-                crate::ui::AgentTokenContext {
-                    workspace: &workspace.label,
-                    tab: tab_label,
-                    pane: agent
-                        .title
-                        .as_deref()
-                        .or_else(|| pane.and_then(|pane| pane.label.as_deref())),
-                    agent_label,
-                    terminal_title: agent.terminal_title.as_deref(),
-                    terminal_title_stripped: agent.terminal_title_stripped.as_deref(),
-                    canonical_agent,
-                    tokens: &tokens,
-                },
-                state_text,
-            );
-            Some(AgentRow {
-                pane_id: agent.pane_id.clone(),
-                status: agent.agent_status,
-                focused: agent.focused,
-                rows,
-            })
+fn agent_rows(
+    snapshot: &ClientShellSnapshot,
+    config: &ClientShellConfig,
+    pinned_agents: &HashSet<String>,
+    unread_agents: &HashSet<String>,
+    agent_manual_order: &[String],
+    dragged_agent_id: Option<&str>,
+) -> Vec<AgentRow> {
+    ordered_agent_pane_ids_with_preferences(
+        snapshot,
+        config.agent_panel_sort,
+        pinned_agents,
+        agent_manual_order,
+    )
+    .into_iter()
+    .filter_map(|pane_id| {
+        let agent = snapshot
+            .agents
+            .iter()
+            .find(|agent| agent.pane_id == pane_id)?;
+        let workspace = snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == agent.workspace_id)?;
+        let tab = snapshot.tabs.iter().find(|tab| tab.tab_id == agent.tab_id);
+        let pane = snapshot
+            .panes
+            .iter()
+            .find(|pane| pane.pane_id == agent.pane_id);
+        let tab_count = snapshot
+            .tabs
+            .iter()
+            .filter(|candidate| candidate.workspace_id == agent.workspace_id)
+            .count();
+        let tab_label = tab
+            .filter(|tab| tab_count > 1 || tab.custom_label)
+            .map(|tab| tab.label.as_str());
+        let agent_label = agent
+            .display_agent
+            .as_deref()
+            .or(agent.name.as_deref())
+            .or(agent.agent.as_deref())
+            .or(agent.title.as_deref());
+        let labels = agent
+            .state_labels
+            .iter()
+            .cloned()
+            .collect::<HashMap<_, _>>();
+        let tokens = agent.tokens.iter().cloned().collect::<HashMap<_, _>>();
+        let state_text = labels
+            .get(status_text(agent.agent_status))
+            .map(String::as_str)
+            .unwrap_or_else(|| sidebar_status_text(agent.agent_status));
+        let canonical_agent = agent
+            .agent
+            .as_deref()
+            .and_then(crate::detect::parse_agent_label);
+        let rows = crate::ui::sidebar_agent_rows(
+            &config.agents,
+            crate::ui::AgentTokenContext {
+                workspace: &workspace.label,
+                tab: tab_label,
+                pane: agent
+                    .title
+                    .as_deref()
+                    .or_else(|| pane.and_then(|pane| pane.label.as_deref())),
+                agent_label,
+                terminal_title: agent.terminal_title.as_deref(),
+                terminal_title_stripped: agent.terminal_title_stripped.as_deref(),
+                canonical_agent,
+                tokens: &tokens,
+            },
+            state_text,
+        );
+        Some(AgentRow {
+            pane_id: agent.pane_id.clone(),
+            status: agent.agent_status,
+            focused: agent.focused,
+            pinned: pinned_agents.contains(&agent.pane_id),
+            unread: unread_agents.contains(&agent.pane_id),
+            dragged: dragged_agent_id == Some(agent.pane_id.as_str()),
+            rows,
         })
-        .collect()
+    })
+    .collect()
 }
 
 fn render_agent_row(buffer: &mut Buffer, rect: Rect, row: &AgentRow, config: &ClientShellConfig) {
     let palette = &config.palette;
-    let row_style = if row.focused {
+    let row_style = if row.dragged {
+        Style::default().bg(palette.surface1)
+    } else if row.focused {
         Style::default().bg(palette.active_row_bg)
     } else {
         Style::default()
@@ -300,7 +398,13 @@ fn render_agent_row(buffer: &mut Buffer, rect: Rect, row: &AgentRow, config: &Cl
     } else {
         row.rows.clone()
     };
+    buffer.set_style(rect, row_style);
     for (index, tokens) in rows.iter().take(rect.height as usize).enumerate() {
+        let content_width = if index == 0 {
+            rect.width.saturating_sub(4)
+        } else {
+            rect.width
+        };
         let indent = if index == 0 { 1 } else { 3 };
         let mut spans = vec![ratatui::text::Span::raw(" ".repeat(indent))];
         spans.extend(crate::ui::resolved_token_spans(
@@ -311,10 +415,10 @@ fn render_agent_row(buffer: &mut Buffer, rect: Rect, row: &AgentRow, config: &Cl
             secondary,
             secondary,
             palette,
-            rect.width.saturating_sub(indent as u16) as usize,
+            content_width.saturating_sub(indent as u16) as usize,
         ));
         Paragraph::new(Line::from(spans)).style(row_style).render(
-            Rect::new(rect.x, rect.y + index as u16, rect.width, 1),
+            Rect::new(rect.x, rect.y + index as u16, content_width, 1),
             buffer,
         );
     }

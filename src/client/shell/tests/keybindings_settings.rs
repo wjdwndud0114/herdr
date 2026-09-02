@@ -62,6 +62,10 @@ fn manual_client_chrome_preferences_round_trip_per_endpoint() {
     state.sidebar_collapsed_manual = true;
     state.collapsed_groups.insert("repo-two".into());
     state.collapsed_groups.insert("repo-one".into());
+    state.pinned_agents.insert("pane-two".into());
+    state.pinned_agents.insert("pane-one".into());
+    state.unread_agents.insert("pane-two".into());
+    state.agent_manual_order = vec!["pane-two".into(), "pane-one".into()];
     state.persist_chrome_preferences(&mut ClientShellInput::default());
 
     let reloaded_config =
@@ -76,6 +80,18 @@ fn manual_client_chrome_preferences_round_trip_per_endpoint() {
     assert_eq!(
         reloaded.collapsed_groups,
         HashSet::from(["repo-one".to_string(), "repo-two".to_string()])
+    );
+    assert_eq!(
+        reloaded.pinned_agents,
+        HashSet::from(["pane-one".to_string(), "pane-two".to_string()])
+    );
+    assert_eq!(
+        reloaded.unread_agents,
+        HashSet::from(["pane-two".to_string()])
+    );
+    assert_eq!(
+        reloaded.agent_manual_order,
+        vec!["pane-two".to_string(), "pane-one".to_string()]
     );
     std::fs::remove_file(path).expect("remove client chrome preferences");
 }

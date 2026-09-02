@@ -8,7 +8,9 @@ use ratatui::layout::Direction;
 use tokio::sync::{mpsc, Notify};
 
 use crate::events::AppEvent;
-use crate::layout::{PaneId, TileLayout};
+use crate::layout::PaneId;
+#[cfg(test)]
+use crate::layout::TileLayout;
 use crate::pane::{PaneLaunchEnv, PaneState};
 use crate::render_signal::RenderSignal;
 use crate::terminal::{TerminalId, TerminalRuntime, TerminalRuntimeRegistry, TerminalState};
@@ -204,16 +206,6 @@ pub struct Workspace {
     pub(crate) test_runtimes: HashMap<PaneId, TerminalRuntime>,
 }
 
-/// Runtime-free tab data used by client-owned shells that project server snapshots through the
-/// normal workspace, sidebar, and navigator renderers.
-pub(crate) struct SidebarPlaceholderTab {
-    pub(crate) label: Option<String>,
-    pub(crate) number: usize,
-    pub(crate) pane_terminals: Vec<(TerminalId, bool)>,
-    pub(crate) pane_ids: Vec<PaneId>,
-    pub(crate) focused_pane_idx: Option<usize>,
-}
-
 impl Deref for Workspace {
     type Target = Tab;
 
@@ -231,126 +223,6 @@ impl DerefMut for Workspace {
 }
 
 impl Workspace {
-    pub(crate) fn sidebar_placeholder_with_tabs(
-        id: String,
-        name: String,
-        branch: Option<String>,
-        mut placeholder_tabs: Vec<SidebarPlaceholderTab>,
-        active_tab: usize,
-    ) -> (Self, Vec<Vec<PaneId>>) {
-        let (events, _) = mpsc::channel(64);
-        let render_notify = Arc::new(Notify::new());
-        let render_dirty = Arc::new(RenderSignal::new());
-        let identity_cwd = PathBuf::from("/");
-        if placeholder_tabs.is_empty() {
-            placeholder_tabs.push(SidebarPlaceholderTab {
-                label: None,
-                number: 1,
-                pane_terminals: Vec::new(),
-                pane_ids: Vec::new(),
-                focused_pane_idx: None,
-            });
-        }
-
-        let mut public_pane_numbers = HashMap::new();
-        let mut next_public_pane_number = 1;
-        let mut next_public_tab_number = 1;
-        let mut tabs = Vec::with_capacity(placeholder_tabs.len());
-        let mut tab_pane_ids = Vec::with_capacity(placeholder_tabs.len());
-
-        for mut placeholder in placeholder_tabs {
-            if placeholder.pane_terminals.is_empty() {
-                placeholder.pane_terminals.push((TerminalId::alloc(), true));
-            }
-            let pane_count = placeholder.pane_terminals.len();
-            let pane_ids = if placeholder.pane_ids.len() == pane_count {
-                placeholder.pane_ids
-            } else {
-                (0..pane_count).map(|_| PaneId::alloc()).collect()
-            };
-            let root_id = pane_ids[0];
-            let mut panes = HashMap::new();
-
-            let (root_terminal_id, root_seen) = placeholder.pane_terminals[0].clone();
-            let mut root_pane = PaneState::new(root_terminal_id);
-            root_pane.seen = root_seen;
-            panes.insert(root_id, root_pane);
-            public_pane_numbers.insert(root_id, next_public_pane_number);
-            next_public_pane_number += 1;
-
-            for ((terminal_id, seen), pane_id) in placeholder
-                .pane_terminals
-                .into_iter()
-                .skip(1)
-                .zip(pane_ids.iter().copied().skip(1))
-            {
-                let mut pane = PaneState::new(terminal_id);
-                pane.seen = seen;
-                panes.insert(pane_id, pane);
-                public_pane_numbers.insert(pane_id, next_public_pane_number);
-                next_public_pane_number += 1;
-            }
-
-            let focused_pane = placeholder
-                .focused_pane_idx
-                .and_then(|idx| pane_ids.get(idx).copied())
-                .unwrap_or(root_id);
-            let layout_root = pane_ids.iter().copied().skip(1).fold(
-                crate::layout::Node::Pane(root_id),
-                |first, pane_id| crate::layout::Node::Split {
-                    direction: Direction::Vertical,
-                    ratio: 0.5,
-                    first: Box::new(first),
-                    second: Box::new(crate::layout::Node::Pane(pane_id)),
-                },
-            );
-            let layout = TileLayout::from_saved(layout_root, focused_pane);
-
-            next_public_tab_number = next_public_tab_number.max(placeholder.number + 1);
-            tabs.push(Tab {
-                custom_name: placeholder.label,
-                number: placeholder.number,
-                root_pane: root_id,
-                layout,
-                panes,
-                #[cfg(test)]
-                runtimes: HashMap::new(),
-                zoomed: false,
-                events: events.clone(),
-                render_notify: render_notify.clone(),
-                render_dirty: render_dirty.clone(),
-            });
-            tab_pane_ids.push(pane_ids);
-        }
-
-        let active_tab = active_tab.min(tabs.len().saturating_sub(1));
-
-        (
-            Self {
-                id,
-                custom_name: Some(name),
-                identity_cwd: identity_cwd.clone(),
-                cached_identity_cwd: identity_cwd.clone(),
-                cached_auto_label: fallback_label_from_cwd(&identity_cwd),
-                cached_git_status_key: identity_cwd,
-                cached_git_branch: branch,
-                cached_git_ahead_behind: None,
-                cached_git_space: None,
-                worktree_space: None,
-                metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
-                metadata_token_sequences: HashMap::new(),
-                public_pane_numbers,
-                next_public_pane_number,
-                next_public_tab_number,
-                tabs,
-                active_tab,
-                #[cfg(test)]
-                test_runtimes: HashMap::new(),
-            },
-            tab_pane_ids,
-        )
-    }
-
     fn adjust_active_tab_after_removal(&mut self, removed_idx: usize) {
         if self.tabs.is_empty() {
             self.active_tab = 0;

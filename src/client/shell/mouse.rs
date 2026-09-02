@@ -4,6 +4,47 @@ use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 const SELECTION_AUTOSCROLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(30);
 
 impl ClientShellState {
+    pub(super) fn ordered_agent_ids(&self) -> Vec<String> {
+        self.snapshot
+            .as_deref()
+            .map(|snapshot| {
+                super::agent_sidebar::ordered_agent_pane_ids_with_preferences(
+                    snapshot,
+                    self.config.agent_panel_sort,
+                    &self.pinned_agents,
+                    &self.agent_manual_order,
+                )
+            })
+            .unwrap_or_default()
+    }
+
+    fn agent_drop_index_at(&self, point: (u16, u16)) -> Option<usize> {
+        let ordered = self.ordered_agent_ids();
+        for (rect, pane_id) in &self.hits.agents {
+            if point.1 < rect.y.saturating_add(rect.height.max(1) / 2) {
+                return ordered.iter().position(|id| id == pane_id);
+            }
+            if super::contains(*rect, point) {
+                return ordered
+                    .iter()
+                    .position(|id| id == pane_id)
+                    .map(|index| index + 1);
+            }
+        }
+        super::contains(self.hits.agent_body, point).then_some(ordered.len())
+    }
+
+    fn reorder_agent(&mut self, pane_id: &str, insert_index: usize) {
+        let mut ordered = self.ordered_agent_ids();
+        let Some(source) = ordered.iter().position(|id| id == pane_id) else {
+            return;
+        };
+        let pane_id = ordered.remove(source);
+        let target = insert_index.saturating_sub(usize::from(source < insert_index));
+        ordered.insert(target.min(ordered.len()), pane_id);
+        self.agent_manual_order = ordered;
+    }
+
     fn set_sidebar_width_from_column(&mut self, column: u16, outcome: &mut ClientShellInput) {
         let (min, max) = crate::config::validated_sidebar_bounds(
             self.config.sidebar_min_width,
@@ -1100,7 +1141,35 @@ impl ClientShellState {
                     outcome.repaint = true;
                     return;
                 }
+                Some(ClientChromeDrag::Agent { .. }) => {
+                    let insert_index = self.agent_drop_index_at(point);
+                    if let Some(ClientChromeDrag::Agent {
+                        insert_index: current,
+                        ..
+                    }) = self.chrome_drag.as_mut()
+                    {
+                        *current = insert_index;
+                    }
+                    outcome.repaint = true;
+                    return;
+                }
                 None => {}
+            }
+            if let Some(press) = self.agent_press.as_ref() {
+                let delta = mouse
+                    .column
+                    .abs_diff(press.start_column)
+                    .max(mouse.row.abs_diff(press.start_row));
+                if delta >= 1 {
+                    if let Some(insert_index) = self.agent_drop_index_at(point) {
+                        self.chrome_drag = Some(ClientChromeDrag::Agent {
+                            pane_id: press.pane_id.clone(),
+                            insert_index: Some(insert_index),
+                        });
+                        outcome.repaint = true;
+                    }
+                }
+                return;
             }
             if let Some(press) = self.workspace_press.as_ref() {
                 let delta = mouse
@@ -1158,6 +1227,7 @@ impl ClientShellState {
             if let Some(drag) = self.chrome_drag.take() {
                 self.workspace_press = None;
                 self.tab_press = None;
+                self.agent_press = None;
                 match drag {
                     ClientChromeDrag::Tab {
                         tab_id,
@@ -1256,6 +1326,19 @@ impl ClientShellState {
                             );
                         }
                     }
+                    ClientChromeDrag::Agent {
+                        pane_id,
+                        insert_index,
+                    } => {
+                        if let Some(insert_index) = insert_index {
+                            self.reorder_agent(&pane_id, insert_index);
+                            self.config.agent_panel_sort =
+                                crate::config::AgentPanelSortConfig::Manual;
+                            self.agent_panel_sort_manual = true;
+                            self.persist_agent_preferences();
+                        }
+                        outcome.repaint = true;
+                    }
                     ClientChromeDrag::SidebarWidth | ClientChromeDrag::SidebarSection => {
                         self.persist_chrome_preferences(outcome);
                     }
@@ -1265,6 +1348,15 @@ impl ClientShellState {
                     | ClientChromeDrag::ProductAnnouncementScrollbar { .. }
                     | ClientChromeDrag::ReleaseNotesScrollbar { .. } => {}
                 }
+                return;
+            }
+            if let Some(press) = self.agent_press.take() {
+                self.push_endpoint_method(
+                    crate::api::schema::Method::PaneFocus(crate::api::schema::PaneTarget {
+                        pane_id: press.pane_id,
+                    }),
+                    outcome,
+                );
                 return;
             }
             if let Some(press) = self.workspace_press.take() {
@@ -1858,6 +1950,7 @@ impl ClientShellState {
                 let previous_pane_click = self.last_pane_click.take();
                 self.workspace_press = None;
                 self.tab_press = None;
+                self.agent_press = None;
                 self.chrome_drag = None;
                 if super::contains(self.hits.sidebar_divider, point)
                     && !super::contains(self.hits.sidebar_toggle, point)
@@ -1933,12 +2026,43 @@ impl ClientShellState {
                     }
                     return;
                 }
+                let pin_target = self
+                    .hits
+                    .agent_pins
+                    .iter()
+                    .find(|(rect, _)| super::contains(*rect, point))
+                    .map(|(_, pane_id)| pane_id.clone());
+                if let Some(pane_id) = pin_target {
+                    if !self.pinned_agents.remove(&pane_id) {
+                        self.pinned_agents.insert(pane_id);
+                    }
+                    self.persist_agent_preferences();
+                    outcome.repaint = true;
+                    return;
+                }
+                let unread_target = self
+                    .hits
+                    .agent_unreads
+                    .iter()
+                    .find(|(rect, _)| super::contains(*rect, point))
+                    .map(|(_, pane_id)| pane_id.clone());
+                if let Some(pane_id) = unread_target {
+                    if !self.unread_agents.remove(&pane_id) {
+                        self.unread_agents.insert(pane_id);
+                    }
+                    self.persist_agent_preferences();
+                    outcome.repaint = true;
+                    return;
+                }
                 if super::contains(self.hits.agent_sort_toggle, point) {
                     let sort = match self.config.agent_panel_sort {
                         crate::config::AgentPanelSortConfig::Spaces => {
                             crate::config::AgentPanelSortConfig::Priority
                         }
                         crate::config::AgentPanelSortConfig::Priority => {
+                            crate::config::AgentPanelSortConfig::Manual
+                        }
+                        crate::config::AgentPanelSortConfig::Manual => {
                             crate::config::AgentPanelSortConfig::Spaces
                         }
                     };
@@ -2066,12 +2190,11 @@ impl ClientShellState {
                     .find(|(rect, _)| super::contains(*rect, point))
                     .map(|(_, pane_id)| pane_id.clone());
                 if let Some(pane_id) = agent_pane_id {
-                    self.push_endpoint_method(
-                        crate::api::schema::Method::PaneFocus(crate::api::schema::PaneTarget {
-                            pane_id,
-                        }),
-                        outcome,
-                    );
+                    self.agent_press = Some(ClientAgentPress {
+                        pane_id,
+                        start_column: mouse.column,
+                        start_row: mouse.row,
+                    });
                     return;
                 }
                 let scrollbar_hit = self

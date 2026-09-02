@@ -139,6 +139,8 @@ pub(super) struct ShellHitMap {
     pub(super) popup: Option<PaneHit>,
     pub(super) pane_splits: Vec<PaneSplitHit>,
     pub(super) agents: Vec<(Rect, String)>,
+    pub(super) agent_pins: Vec<(Rect, String)>,
+    pub(super) agent_unreads: Vec<(Rect, String)>,
     pub(super) agent_body: Rect,
     pub(super) agent_scrollbar: Rect,
     pub(super) agent_scroll_metrics: Option<crate::pane::ScrollMetrics>,
@@ -227,6 +229,12 @@ pub(super) struct ClientTabPress {
     pub(super) start_row: u16,
 }
 
+pub(super) struct ClientAgentPress {
+    pub(super) pane_id: String,
+    pub(super) start_column: u16,
+    pub(super) start_row: u16,
+}
+
 pub(super) enum ClientChromeDrag {
     SidebarWidth,
     SidebarSection,
@@ -253,6 +261,10 @@ pub(super) enum ClientChromeDrag {
     Workspace {
         source_workspace_id: String,
         target: Option<(Option<String>, u16)>,
+    },
+    Agent {
+        pane_id: String,
+        insert_index: Option<usize>,
     },
     PaneSplit {
         hit: PaneSplitHit,
@@ -875,6 +887,10 @@ pub(crate) struct ClientShellState {
     pub(super) chrome_drag: Option<ClientChromeDrag>,
     pub(super) workspace_press: Option<ClientWorkspacePress>,
     pub(super) tab_press: Option<ClientTabPress>,
+    pub(super) agent_press: Option<ClientAgentPress>,
+    pub(super) pinned_agents: HashSet<String>,
+    pub(super) unread_agents: HashSet<String>,
+    pub(super) agent_manual_order: Vec<String>,
     pub(super) collapsed_groups: HashSet<String>,
     pub(super) workspace_scroll: usize,
     pub(super) agent_scroll: usize,
@@ -1017,6 +1033,10 @@ impl ClientShellState {
             chrome_drag: None,
             workspace_press: None,
             tab_press: None,
+            agent_press: None,
+            pinned_agents: preferences.pinned_agents.into_iter().collect(),
+            unread_agents: preferences.unread_agents.into_iter().collect(),
+            agent_manual_order: preferences.agent_manual_order,
             collapsed_groups: preferences.collapsed_groups.into_iter().collect(),
             workspace_scroll: 0,
             agent_scroll: 0,
@@ -1183,6 +1203,26 @@ impl ClientShellState {
             return;
         }
         self.graphics.set_scope(&snapshot.boot_id);
+        let live_agents = snapshot
+            .agents
+            .iter()
+            .map(|agent| agent.pane_id.as_str())
+            .collect::<HashSet<_>>();
+        let pinned_count = self.pinned_agents.len();
+        let unread_count = self.unread_agents.len();
+        let order_count = self.agent_manual_order.len();
+        self.pinned_agents
+            .retain(|pane_id| live_agents.contains(pane_id.as_str()));
+        self.unread_agents
+            .retain(|pane_id| live_agents.contains(pane_id.as_str()));
+        self.agent_manual_order
+            .retain(|pane_id| live_agents.contains(pane_id.as_str()));
+        if pinned_count != self.pinned_agents.len()
+            || unread_count != self.unread_agents.len()
+            || order_count != self.agent_manual_order.len()
+        {
+            self.persist_agent_preferences();
+        }
         let command_bindings_changed = self.snapshot.as_ref().is_none_or(|current| {
             current.commands.len() != snapshot.commands.len()
                 || current
@@ -1240,6 +1280,7 @@ impl ClientShellState {
             self.chrome_drag = None;
             self.workspace_press = None;
             self.tab_press = None;
+            self.agent_press = None;
             self.workspace_scroll = 0;
             self.agent_scroll = 0;
             self.tab_scroll = 0;

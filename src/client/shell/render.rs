@@ -7,7 +7,7 @@ mod sidebar;
 #[path = "../shell/tabs.rs"]
 mod tabs;
 
-pub(super) use super::agent_sidebar::{ordered_agent_pane_ids, render_agent_panel};
+pub(super) use super::agent_sidebar::render_agent_panel;
 pub(super) use overlays::{
     client_navigator_rows, render_client_overlay, render_context_menu, render_global_menu,
 };
@@ -208,6 +208,11 @@ pub(super) struct ShellRenderState<'a> {
     pub(super) selected_workspace_id: Option<&'a str>,
     pub(super) dragged_workspace_id: Option<&'a str>,
     pub(super) workspace_drop_indicator_row: Option<u16>,
+    pub(super) pinned_agents: &'a HashSet<String>,
+    pub(super) unread_agents: &'a HashSet<String>,
+    pub(super) agent_manual_order: &'a [String],
+    pub(super) dragged_agent_id: Option<&'a str>,
+    pub(super) agent_drop_insert_index: Option<usize>,
 }
 
 pub(super) fn render_shell(
@@ -235,6 +240,9 @@ pub(super) fn render_shell(
                 snapshot,
                 config,
                 state.selected_workspace_id,
+                state.pinned_agents,
+                state.unread_agents,
+                state.agent_manual_order,
                 &mut hits,
             );
         } else {
@@ -269,6 +277,8 @@ pub(super) fn render_shell(
         hits.new_workspace = Rect::default();
         hits.workspaces.clear();
         hits.agents.clear();
+        hits.agent_pins.clear();
+        hits.agent_unreads.clear();
         hits.tab_scroll_left = Rect::default();
         hits.tab_scroll_right = Rect::default();
         hits.new_tab = Rect::default();

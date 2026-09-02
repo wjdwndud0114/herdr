@@ -28,6 +28,9 @@ pub(crate) fn render_collapsed_sidebar(
     snapshot: &ClientShellSnapshot,
     config: &ClientShellConfig,
     selected_workspace_id: Option<&str>,
+    pinned_agents: &HashSet<String>,
+    unread_agents: &HashSet<String>,
+    agent_manual_order: &[String],
     hits: &mut ShellHitMap,
 ) {
     let palette = &config.palette;
@@ -108,10 +111,15 @@ pub(crate) fn render_collapsed_sidebar(
         detail_area.width,
         detail_area.height.saturating_sub(1),
     );
-    for (index, pane_id) in super::ordered_agent_pane_ids(snapshot, config.agent_panel_sort)
-        .into_iter()
-        .take(detail_content.height as usize)
-        .enumerate()
+    for (index, pane_id) in super::agent_sidebar::ordered_agent_pane_ids_with_preferences(
+        snapshot,
+        config.agent_panel_sort,
+        pinned_agents,
+        agent_manual_order,
+    )
+    .into_iter()
+    .take(detail_content.height as usize)
+    .enumerate()
     {
         let Some(agent) = snapshot
             .agents
@@ -149,6 +157,16 @@ pub(crate) fn render_collapsed_sidebar(
             status_icon(agent.agent_status, config.status_indicators),
             Style::default().fg(status_color(agent.agent_status, palette)),
         );
+        if unread_agents.contains(&agent.pane_id) {
+            put_text(
+                buffer,
+                rect.right().saturating_sub(1),
+                rect.y,
+                1,
+                "●",
+                Style::default().fg(palette.accent),
+            );
+        }
         hits.agents.push((rect, pane_id));
     }
     hits.sidebar_toggle = if area.is_empty() || workspace_area.width == 0 {
@@ -421,6 +439,11 @@ pub(crate) fn render_sidebar(
         snapshot,
         config,
         state.agent_scroll,
+        state.pinned_agents,
+        state.unread_agents,
+        state.agent_manual_order,
+        state.dragged_agent_id,
+        state.agent_drop_insert_index,
         hits,
     );
 

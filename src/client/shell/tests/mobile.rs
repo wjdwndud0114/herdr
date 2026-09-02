@@ -112,6 +112,7 @@ fn mobile_header_and_switcher_render_released_sections_and_stable_targets() {
     });
     projected.workspaces[0].agent_status = AgentStatus::Blocked;
     state.set_snapshot(Box::new(projected));
+    state.unread_agents.insert("pane_1".into());
     let mut projected_surface = surface();
     for cell in &mut projected_surface.frame.cells {
         cell.symbol = "X".to_owned();
@@ -155,6 +156,10 @@ fn mobile_header_and_switcher_render_released_sections_and_stable_targets() {
     assert!(
         !switcher_text.contains('X'),
         "switcher must clear the pane surface"
+    );
+    assert!(
+        switcher_text.contains('●'),
+        "unread agent marker is visible"
     );
     for expected in [
         "switch",

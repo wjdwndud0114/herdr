@@ -67,6 +67,17 @@ impl ClientShellState {
                     .flatten(),
                 dragged_workspace_id,
                 workspace_drop_indicator_row,
+                pinned_agents: &self.pinned_agents,
+                unread_agents: &self.unread_agents,
+                agent_manual_order: &self.agent_manual_order,
+                dragged_agent_id: match &self.chrome_drag {
+                    Some(ClientChromeDrag::Agent { pane_id, .. }) => Some(pane_id.as_str()),
+                    _ => None,
+                },
+                agent_drop_insert_index: match &self.chrome_drag {
+                    Some(ClientChromeDrag::Agent { insert_index, .. }) => *insert_index,
+                    _ => None,
+                },
             },
         );
         self.hits.panes = surface
@@ -401,6 +412,9 @@ impl ClientShellState {
                 snapshot,
                 &self.config,
                 self.navigate_workspace_id.as_deref(),
+                &self.pinned_agents,
+                &self.unread_agents,
+                &self.agent_manual_order,
                 &mut self.mobile_switcher_scroll,
                 &mut self.reveal_mobile_workspace,
                 &mut self.hits,

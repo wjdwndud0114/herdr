@@ -716,7 +716,7 @@ fn prepare_remote_herdr(
 fn prepare_fleet_remote_herdr(ssh: &RemoteSsh) -> io::Result<PreparedRemoteHerdr> {
     let platform = detect_remote_platform(ssh)?;
     let remote_herdr = RemoteHerdr::for_fleet_platform(platform);
-    if !remote_binary_matches(ssh, &remote_herdr)? {
+    if !remote_binary_supports_endpoint(ssh, &remote_herdr)? {
         return Err(io::Error::other(format!(
             "remote fleet binary {} is missing or incompatible; install this build as ~/.local/bin/herdr-multi on {}",
             remote_herdr.shell_path,

@@ -16,6 +16,31 @@ pub(super) fn merged_config_diagnostic(
 }
 
 impl ClientShellState {
+    fn chrome_preferences(&self) -> preferences::ClientChromePreferences {
+        let mut collapsed_groups = self.collapsed_groups.iter().cloned().collect::<Vec<_>>();
+        collapsed_groups.sort();
+        let mut pinned_agents = self.pinned_agents.iter().cloned().collect::<Vec<_>>();
+        pinned_agents.sort();
+        let mut unread_agents = self.unread_agents.iter().cloned().collect::<Vec<_>>();
+        unread_agents.sort();
+        preferences::ClientChromePreferences {
+            sidebar_width: self.sidebar_width_manual.then_some(self.sidebar_width),
+            sidebar_section_split: self
+                .sidebar_section_split_manual
+                .then_some(self.sidebar_section_split),
+            sidebar_collapsed: self
+                .sidebar_collapsed_manual
+                .then_some(self.sidebar_collapsed),
+            agent_panel_sort: self
+                .agent_panel_sort_manual
+                .then_some(self.config.agent_panel_sort),
+            collapsed_groups,
+            pinned_agents,
+            unread_agents,
+            agent_manual_order: self.agent_manual_order.clone(),
+        }
+    }
+
     pub(super) fn set_local_config_diagnostic(&mut self, diagnostic: Option<String>) {
         self.local_config_diagnostic = diagnostic;
         self.config_diagnostic = merged_config_diagnostic(
@@ -30,24 +55,19 @@ impl ClientShellState {
         let Some(path) = self.config.preferences_path.as_deref() else {
             return;
         };
-        let mut collapsed_groups = self.collapsed_groups.iter().cloned().collect::<Vec<_>>();
-        collapsed_groups.sort();
-        let preferences = preferences::ClientChromePreferences {
-            sidebar_width: self.sidebar_width_manual.then_some(self.sidebar_width),
-            sidebar_section_split: self
-                .sidebar_section_split_manual
-                .then_some(self.sidebar_section_split),
-            sidebar_collapsed: self
-                .sidebar_collapsed_manual
-                .then_some(self.sidebar_collapsed),
-            agent_panel_sort: self
-                .agent_panel_sort_manual
-                .then_some(self.config.agent_panel_sort),
-            collapsed_groups,
-        };
+        let preferences = self.chrome_preferences();
         if let Err(error) = preferences::store(path, preferences) {
             self.endpoint_error = Some(error);
             outcome.repaint = true;
+        }
+    }
+
+    pub(super) fn persist_agent_preferences(&mut self) {
+        let Some(path) = self.config.preferences_path.as_deref() else {
+            return;
+        };
+        if let Err(error) = preferences::store(path, self.chrome_preferences()) {
+            self.endpoint_error = Some(error);
         }
     }
 

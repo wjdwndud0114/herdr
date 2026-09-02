@@ -515,8 +515,15 @@ fn agent_sidebar_honors_priority_symbols_tokens_and_stable_hits() {
     );
 
     let first = state.hits.agents[0].0;
-    let click = state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+    let down = state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
+        column: first.x,
+        row: first.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+    assert!(down.actions.is_empty());
+    let click = state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
         column: first.x,
         row: first.y,
         modifiers: KeyModifiers::empty(),
@@ -558,6 +565,7 @@ fn agent_sidebar_honors_priority_symbols_tokens_and_stable_hits() {
     );
 
     state.sidebar_collapsed = true;
+    state.unread_agents.insert("pane_2".into());
     let compact = state.compose(106, 30).expect("compact agent sidebar frame");
     let blocked = state
         .hits
@@ -569,6 +577,10 @@ fn agent_sidebar_honors_priority_symbols_tokens_and_stable_hits() {
     let row_start = blocked.y as usize * compact.width as usize + blocked.x as usize;
     assert_ne!(compact.cells[row_start].fg, compact.cells[row_start + 2].fg);
     assert_eq!(compact.cells[row_start].bg, compact.cells[row_start + 2].bg);
+    assert_eq!(
+        compact.cells[row_start + usize::from(blocked.width.saturating_sub(1))].symbol,
+        "●"
+    );
 }
 
 #[test]
@@ -724,12 +736,23 @@ fn agent_sort_toggle_is_client_local_and_persists_per_endpoint() {
         crate::config::AgentPanelSortConfig::Priority
     );
     assert!(click.actions.is_empty());
+    let click = state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: toggle.x,
+        row: toggle.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+    assert_eq!(
+        state.config.agent_panel_sort,
+        crate::config::AgentPanelSortConfig::Manual
+    );
+    assert!(click.actions.is_empty());
     let reloaded_config =
         ClientShellConfig::from_config(&Config::default()).with_preferences_path(path.clone());
     let reloaded = ClientShellState::new(reloaded_config);
     assert_eq!(
         reloaded.config.agent_panel_sort,
-        crate::config::AgentPanelSortConfig::Priority
+        crate::config::AgentPanelSortConfig::Manual
     );
     assert!(reloaded.agent_panel_sort_manual);
     std::fs::remove_file(path).expect("remove agent sort preferences");
@@ -1275,4 +1298,142 @@ fn semantic_notifications_use_client_policy_and_stable_navigation_targets() {
     assert!(repaint);
     assert!(state.visible_notification.is_none());
     assert_eq!(state.pending_notifications.len(), 1);
+}
+
+#[test]
+fn agent_markers_sort_and_are_pruned_with_manual_order_on_removal() {
+    let mut projected = snapshot();
+    for (pane_id, sequence) in [("pane_1", 1), ("pane_2", 2)] {
+        projected.agents.push(ClientShellAgent {
+            pane_id: pane_id.into(),
+            workspace_id: "ws_1".into(),
+            tab_id: "tab_1".into(),
+            name: Some(pane_id.into()),
+            display_agent: None,
+            agent: Some("pi".into()),
+            title: None,
+            terminal_title: None,
+            terminal_title_stripped: None,
+            agent_status: AgentStatus::Working,
+            state_change_seq: sequence,
+            state_labels: Vec::new(),
+            tokens: Vec::new(),
+            focused: pane_id == "pane_1",
+        });
+    }
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.pinned_agents.insert("pane_2".into());
+    state.unread_agents.insert("pane_2".into());
+    state.config.agent_panel_sort = crate::config::AgentPanelSortConfig::Manual;
+    state.agent_manual_order = vec!["pane_2".into(), "pane_1".into()];
+    state.set_snapshot(Box::new(projected.clone()));
+    assert_eq!(state.ordered_agent_ids(), vec!["pane_2", "pane_1"]);
+
+    projected.agents.retain(|agent| agent.pane_id == "pane_1");
+    projected.revision += 1;
+    state.set_snapshot(Box::new(projected));
+    assert!(!state.pinned_agents.contains("pane_2"));
+    assert!(!state.unread_agents.contains("pane_2"));
+    assert_eq!(state.agent_manual_order, vec!["pane_1"]);
+}
+
+#[test]
+fn agent_unread_marker_toggles_without_focusing() {
+    let mut projected = snapshot();
+    projected.agents.push(ClientShellAgent {
+        pane_id: "pane_1".into(),
+        workspace_id: "ws_1".into(),
+        tab_id: "tab_1".into(),
+        name: Some("pi".into()),
+        display_agent: None,
+        agent: Some("pi".into()),
+        title: None,
+        terminal_title: None,
+        terminal_title_stripped: None,
+        agent_status: AgentStatus::Working,
+        state_change_seq: 1,
+        state_labels: Vec::new(),
+        tokens: Vec::new(),
+        focused: true,
+    });
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(projected));
+    state.set_pane_surface(surface());
+    state.compose(106, 30).expect("agent sidebar frame");
+    let marker = state.hits.agent_unreads[0].0;
+
+    let mark = state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: marker.x,
+        row: marker.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+    assert!(mark.actions.is_empty());
+    assert!(state.unread_agents.contains("pane_1"));
+
+    let clear = state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: marker.x,
+        row: marker.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+    assert!(clear.actions.is_empty());
+    assert!(!state.unread_agents.contains("pane_1"));
+}
+
+#[test]
+fn agent_drag_reorders_without_focusing() {
+    let mut projected = snapshot();
+    for (pane_id, sequence) in [("pane_1", 1), ("pane_2", 2)] {
+        projected.agents.push(ClientShellAgent {
+            pane_id: pane_id.into(),
+            workspace_id: "ws_1".into(),
+            tab_id: "tab_1".into(),
+            name: Some(pane_id.into()),
+            display_agent: None,
+            agent: Some("pi".into()),
+            title: None,
+            terminal_title: None,
+            terminal_title_stripped: None,
+            agent_status: AgentStatus::Working,
+            state_change_seq: sequence,
+            state_labels: Vec::new(),
+            tokens: Vec::new(),
+            focused: pane_id == "pane_1",
+        });
+    }
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(projected));
+    state.set_pane_surface(surface());
+    state.compose(106, 30).expect("agent sidebar frame");
+    let first = state.hits.agents[0].0;
+    let second = state.hits.agents[1].0;
+
+    let down = state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: first.x,
+        row: first.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+    assert!(down.actions.is_empty());
+    let drag = state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: second.x,
+        row: second.bottom().saturating_sub(1),
+        modifiers: KeyModifiers::empty(),
+    })]);
+    assert!(drag.actions.is_empty());
+    let release =
+        state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: second.x,
+            row: second.bottom().saturating_sub(1),
+            modifiers: KeyModifiers::empty(),
+        })]);
+    assert!(release.actions.is_empty());
+    assert_eq!(state.agent_manual_order, vec!["pane_2", "pane_1"]);
+    assert_eq!(
+        state.config.agent_panel_sort,
+        crate::config::AgentPanelSortConfig::Manual
+    );
 }

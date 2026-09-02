@@ -351,12 +351,42 @@ fn run_client_with_mode(
     attach_escape: Option<AttachEscapeState>,
     log_message: &'static str,
 ) -> io::Result<()> {
+    let socket_path = client_socket_path();
+    run_client_with_mode_at(
+        attach_request,
+        attach_escape,
+        log_message,
+        socket_path,
+        None,
+    )
+}
+
+#[cfg(unix)]
+pub(super) fn run_client_at(
+    socket_path: std::path::PathBuf,
+    preferences_endpoint: std::path::PathBuf,
+) -> io::Result<()> {
+    run_client_with_mode_at(
+        None,
+        None,
+        "connecting to fleet",
+        socket_path,
+        Some(preferences_endpoint),
+    )
+}
+
+fn run_client_with_mode_at(
+    attach_request: Option<(String, bool)>,
+    attach_escape: Option<AttachEscapeState>,
+    log_message: &'static str,
+    socket_path: std::path::PathBuf,
+    preferences_endpoint: Option<std::path::PathBuf>,
+) -> io::Result<()> {
     init_logging();
 
     let loaded_config = crate::config::Config::load();
     crate::terminal_modes::clear_host_mouse_reporting(&mut io::stdout())?;
     let client_rendered_shell = attach_request.is_none();
-    let socket_path = client_socket_path();
     let keybinding_source = client_shell_keybinding_source();
     let startup_config_diagnostic =
         if keybinding_source == shell::ClientShellKeybindingSource::Endpoint {
@@ -369,7 +399,7 @@ fn run_client_with_mode(
             .with_startup_config_diagnostic(startup_config_diagnostic)
             .with_startup_onboarding(loaded_config.config.should_show_onboarding())
             .with_keybinding_source(keybinding_source)
-            .with_local_endpoint(&socket_path)
+            .with_local_endpoint(preferences_endpoint.as_deref().unwrap_or(&socket_path))
     });
     let mouse_capture = loaded_config.config.ui.mouse_capture;
     let mouse_scroll_lines = loaded_config.config.ui.mouse_scroll_lines();

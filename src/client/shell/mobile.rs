@@ -356,6 +356,9 @@ pub(super) fn render_mobile_switcher(
     snapshot: &ClientShellSnapshot,
     config: &ClientShellConfig,
     selected_workspace_id: Option<&str>,
+    pinned_agents: &HashSet<String>,
+    unread_agents: &HashSet<String>,
+    agent_manual_order: &[String],
     scroll: &mut usize,
     reveal_workspace: &mut bool,
     hits: &mut ShellHitMap,
@@ -428,6 +431,9 @@ pub(super) fn render_mobile_switcher(
         snapshot,
         config,
         selected_workspace_id,
+        pinned_agents,
+        unread_agents,
+        agent_manual_order,
         viewport.width.saturating_sub(1),
     );
     let total_rows = items.iter().map(|item| item.lines.len()).sum::<usize>();
@@ -560,12 +566,19 @@ fn mobile_items(
     snapshot: &ClientShellSnapshot,
     config: &ClientShellConfig,
     selected_workspace_id: Option<&str>,
+    pinned_agents: &HashSet<String>,
+    unread_agents: &HashSet<String>,
+    agent_manual_order: &[String],
     content_width: u16,
 ) -> Vec<MobileItem> {
     let palette = &config.palette;
     let mut items = Vec::new();
-    let ordered_agents =
-        super::agent_sidebar::ordered_agent_pane_ids(snapshot, config.agent_panel_sort);
+    let ordered_agents = super::agent_sidebar::ordered_agent_pane_ids_with_preferences(
+        snapshot,
+        config.agent_panel_sort,
+        pinned_agents,
+        agent_manual_order,
+    );
     if !ordered_agents.is_empty() || snapshot.agent_view_label.is_some() {
         let title = snapshot
             .agent_view_label
@@ -643,6 +656,14 @@ fn mobile_items(
                     Line::from(vec![
                         Span::styled("  ", Style::default().bg(background)),
                         Span::styled(
+                            if unread_agents.contains(&agent.pane_id) {
+                                "●"
+                            } else {
+                                " "
+                            },
+                            Style::default().fg(palette.accent).bg(background),
+                        ),
+                        Span::styled(
                             status_icon(agent.agent_status, config.status_indicators),
                             Style::default()
                                 .fg(status_color(agent.agent_status, palette))
@@ -652,7 +673,7 @@ fn mobile_items(
                         Span::styled(
                             crate::ui::truncate_end(
                                 primary,
-                                usize::from(content_width.saturating_sub(5)),
+                                usize::from(content_width.saturating_sub(6)),
                             ),
                             Style::default()
                                 .fg(palette.text)

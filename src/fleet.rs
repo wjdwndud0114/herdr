@@ -69,14 +69,6 @@ impl Default for FleetRegistry {
 }
 
 impl FleetRegistry {
-    pub(crate) fn presentation(&self) -> &FleetPresentation {
-        &self.presentation
-    }
-
-    pub(crate) fn set_presentation(&mut self, presentation: FleetPresentation) {
-        self.presentation = presentation;
-    }
-
     pub(crate) fn enabled_instances(&self) -> impl Iterator<Item = &RemoteInstance> {
         self.instances.iter().filter(|instance| instance.enabled)
     }
