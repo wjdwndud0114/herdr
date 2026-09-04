@@ -1,5 +1,6 @@
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
@@ -21,8 +22,9 @@ use crate::protocol::{
 
 const FLEET_BOOT_ID: &str = "herdr-fleet";
 const CONNECTION_WORKSPACE_ID: &str = "__connection__";
-const INITIAL_AUTOMATIC_ATTEMPTS: u8 = 2;
-const RETRY_INITIAL: Duration = Duration::from_millis(750);
+const FLEET_INSTANCE_TOKEN: &str = "fleet_instance";
+const ENDPOINT_WRITE_QUEUE_CAPACITY: usize = 256;
+const RETRY_INITIAL: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(30);
 
 pub(super) fn is_enabled() -> bool {
@@ -94,7 +96,7 @@ struct Endpoint {
     bridge: Option<crate::remote::FleetRemoteBridge>,
     bridge_status: Option<crate::remote::FleetRemoteBridgeStatus>,
     socket: Option<PathBuf>,
-    writer: Option<LocalStream>,
+    writer: Option<EndpointWriter>,
     generation: u64,
     connecting_bridge: bool,
     connecting_endpoint: bool,
@@ -103,12 +105,76 @@ struct Endpoint {
     known_agent_order: Vec<String>,
     surface: Option<PaneSurfaceFrame>,
     error: Option<String>,
+    agent_error: Option<String>,
     retry_at: Instant,
     retry_delay: Duration,
-    automatic_attempts_remaining: u8,
     attempt_in_progress: bool,
-    live_retry: bool,
-    ever_connected: bool,
+    checking_coder: bool,
+    preflight_ready: bool,
+    retry_allowed: bool,
+}
+
+struct EndpointWriter {
+    sender: mpsc::SyncSender<ClientMessage>,
+    #[cfg(unix)]
+    shutdown: Option<LocalStream>,
+}
+
+impl EndpointWriter {
+    fn start(
+        mut stream: LocalStream,
+        index: usize,
+        generation: u64,
+        event_tx: mpsc::Sender<Event>,
+    ) -> io::Result<Self> {
+        #[cfg(unix)]
+        let shutdown = stream.try_clone()?;
+        let (sender, receiver) = mpsc::sync_channel(ENDPOINT_WRITE_QUEUE_CAPACITY);
+        std::thread::spawn(move || {
+            while let Ok(message) = receiver.recv() {
+                if let Err(error) = write_client(&mut stream, &message) {
+                    let _ = event_tx.send(Event::EndpointClosed {
+                        index,
+                        generation,
+                        error: error.to_string(),
+                    });
+                    break;
+                }
+            }
+        });
+        Ok(Self {
+            sender,
+            #[cfg(unix)]
+            shutdown: Some(shutdown),
+        })
+    }
+
+    fn send(&self, message: &ClientMessage) -> io::Result<()> {
+        self.sender.try_send(message.clone()).map_err(|error| {
+            let kind = match error {
+                mpsc::TrySendError::Full(_) => io::ErrorKind::WouldBlock,
+                mpsc::TrySendError::Disconnected(_) => io::ErrorKind::BrokenPipe,
+            };
+            io::Error::new(kind, error.to_string())
+        })
+    }
+
+    fn finish_gracefully(mut self, message: &ClientMessage) {
+        let _ = self.send(message);
+        #[cfg(unix)]
+        {
+            self.shutdown = None;
+        }
+    }
+}
+
+impl Drop for EndpointWriter {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(shutdown) = self.shutdown.as_ref() {
+            let _ = crate::ipc::shutdown_local_stream(shutdown);
+        }
+    }
 }
 
 impl Endpoint {
@@ -127,12 +193,13 @@ impl Endpoint {
             known_agent_order: Vec::new(),
             surface: None,
             error: None,
+            agent_error: None,
             retry_at: Instant::now(),
             retry_delay: RETRY_INITIAL,
-            automatic_attempts_remaining: INITIAL_AUTOMATIC_ATTEMPTS,
             attempt_in_progress: false,
-            live_retry: false,
-            ever_connected: false,
+            checking_coder: false,
+            preflight_ready: false,
+            retry_allowed: true,
         }
     }
 
@@ -140,27 +207,39 @@ impl Endpoint {
         if self.attempt_in_progress {
             return true;
         }
-        if !self.ever_connected && !self.live_retry {
-            if self.automatic_attempts_remaining == 0 {
-                return false;
-            }
-            self.automatic_attempts_remaining -= 1;
+        if !self.retry_allowed {
+            return false;
         }
         self.attempt_in_progress = true;
         true
     }
 
-    fn enable_live_retry(&mut self) {
-        self.live_retry = true;
+    fn enable_retry(&mut self) {
+        self.retry_allowed = true;
+        self.preflight_ready = false;
         self.retry_at = Instant::now();
         self.retry_delay = RETRY_INITIAL;
     }
 
     fn waiting_for_user(&self) -> bool {
-        !self.ever_connected
-            && !self.live_retry
-            && self.automatic_attempts_remaining == 0
-            && !self.attempt_in_progress
+        !self.retry_allowed && !self.attempt_in_progress
+    }
+
+    fn park(&mut self, error: String) {
+        self.attempt_in_progress = false;
+        self.checking_coder = false;
+        self.preflight_ready = false;
+        self.retry_allowed = false;
+        self.error = Some(error);
+    }
+
+    fn defer_preflight(&mut self, error: String) {
+        self.attempt_in_progress = false;
+        self.checking_coder = false;
+        self.preflight_ready = false;
+        self.error = Some(error);
+        self.retry_at = Instant::now() + self.retry_delay;
+        self.retry_delay = self.retry_delay.saturating_mul(2).min(RETRY_MAX);
     }
 
     fn fail(&mut self, error: String) {
@@ -169,17 +248,21 @@ impl Endpoint {
         self.surface = None;
         self.connecting_endpoint = false;
         self.attempt_in_progress = false;
+        self.checking_coder = false;
+        self.preflight_ready = false;
         self.error = Some(error);
-        self.retry_at = Instant::now() + self.retry_delay;
-        self.retry_delay = self.retry_delay.saturating_mul(2).min(RETRY_MAX);
+        let retry_delay = self.retry_delay;
+        self.retry_at = Instant::now() + retry_delay;
+        self.retry_delay = retry_delay.saturating_mul(2).min(RETRY_MAX);
     }
 
-    fn connected(&mut self, writer: LocalStream) {
+    fn connected(&mut self, writer: EndpointWriter) {
         self.writer = Some(writer);
         self.connecting_endpoint = false;
         self.attempt_in_progress = false;
-        self.live_retry = false;
-        self.ever_connected = true;
+        self.checking_coder = false;
+        self.preflight_ready = false;
+        self.retry_allowed = true;
         self.error = None;
         self.retry_at = Instant::now();
         self.retry_delay = RETRY_INITIAL;
@@ -189,6 +272,10 @@ impl Endpoint {
 enum Event {
     Client(ClientMessage),
     ClientClosed,
+    CoderStatusReady {
+        index: usize,
+        status: CoderWorkspaceStatus,
+    },
     BridgeReady {
         index: usize,
         result: Result<crate::remote::FleetRemoteBridge, String>,
@@ -208,6 +295,12 @@ enum Event {
         generation: u64,
         error: String,
     },
+}
+
+enum CoderWorkspaceStatus {
+    Running,
+    Stopped(String),
+    Unavailable(String),
 }
 
 struct State {
@@ -303,6 +396,10 @@ fn run_proxy(listener: LocalListener, stop: Arc<AtomicBool>) -> io::Result<()> {
                     break;
                 }
             }
+            Ok(Event::CoderStatusReady { index, status }) => {
+                coder_status_ready(&mut state, index, status);
+                send_projection(&mut state)?;
+            }
             Ok(Event::BridgeReady { index, result }) => {
                 bridge_ready(&mut state, index, result);
                 send_projection(&mut state)?;
@@ -333,11 +430,9 @@ fn run_proxy(listener: LocalListener, stop: Arc<AtomicBool>) -> io::Result<()> {
                 generation,
                 error,
             }) => {
-                if state
-                    .endpoints
-                    .get(index)
-                    .is_some_and(|endpoint| endpoint.generation == generation)
-                {
+                if state.endpoints.get(index).is_some_and(|endpoint| {
+                    endpoint.generation == generation && endpoint.writer.is_some()
+                }) {
                     state.endpoints[index].fail(error);
                     send_projection(&mut state)?;
                 }
@@ -346,7 +441,7 @@ fn run_proxy(listener: LocalListener, stop: Arc<AtomicBool>) -> io::Result<()> {
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
-    broadcast(&mut state, &ClientMessage::Detach);
+    detach_all(&mut state);
     Ok(())
 }
 
@@ -393,7 +488,9 @@ fn start_due_connections(state: &mut State) {
     for index in 0..state.endpoints.len() {
         let endpoint = &mut state.endpoints[index];
         if endpoint.writer.is_some()
+            || endpoint.connecting_bridge
             || endpoint.connecting_endpoint
+            || endpoint.checking_coder
             || Instant::now() < endpoint.retry_at
         {
             continue;
@@ -401,6 +498,24 @@ fn start_due_connections(state: &mut State) {
         if !endpoint.begin_attempt() {
             continue;
         }
+        if !endpoint.preflight_ready {
+            if let Some(workspace) = endpoint
+                .definition
+                .target
+                .as_deref()
+                .and_then(coder_workspace_name)
+            {
+                let workspace = workspace.to_owned();
+                let tx = state.tx.clone();
+                endpoint.checking_coder = true;
+                std::thread::spawn(move || {
+                    let status = check_coder_workspace(&workspace);
+                    let _ = tx.send(Event::CoderStatusReady { index, status });
+                });
+                continue;
+            }
+        }
+        endpoint.preflight_ready = false;
         if endpoint.socket.is_none() {
             if endpoint.connecting_bridge {
                 continue;
@@ -437,6 +552,73 @@ fn start_due_connections(state: &mut State) {
                 result,
             });
         });
+    }
+}
+
+fn coder_workspace_name(target: &str) -> Option<&str> {
+    target
+        .strip_prefix("coder.")
+        .filter(|workspace| !workspace.is_empty())
+}
+
+fn check_coder_workspace(workspace: &str) -> CoderWorkspaceStatus {
+    let search = format!("owner:me name:{workspace}");
+    let output = Command::new("coder")
+        .args(["list", "--search", &search, "--output", "json"])
+        .stdin(Stdio::null())
+        .output();
+    let output = match output {
+        Ok(output) if output.status.success() => output,
+        Ok(_) => {
+            return CoderWorkspaceStatus::Unavailable(
+                "Coder status is unavailable; waiting for network".to_owned(),
+            );
+        }
+        Err(error) => {
+            return CoderWorkspaceStatus::Unavailable(format!(
+                "could not run Coder status check: {error}"
+            ));
+        }
+    };
+    let workspaces: serde_json::Value = match serde_json::from_slice(&output.stdout) {
+        Ok(value) => value,
+        Err(error) => {
+            return CoderWorkspaceStatus::Unavailable(format!(
+                "invalid Coder status response: {error}"
+            ));
+        }
+    };
+    let Some(workspace) = workspaces.as_array().and_then(|items| {
+        items
+            .iter()
+            .find(|item| item.get("name").and_then(serde_json::Value::as_str) == Some(workspace))
+    }) else {
+        return CoderWorkspaceStatus::Stopped("Coder workspace was not found".to_owned());
+    };
+    let status = workspace
+        .pointer("/latest_build/status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    if status == "running" {
+        CoderWorkspaceStatus::Running
+    } else {
+        CoderWorkspaceStatus::Stopped(format!("Coder workspace is {status}"))
+    }
+}
+
+fn coder_status_ready(state: &mut State, index: usize, status: CoderWorkspaceStatus) {
+    let Some(endpoint) = state.endpoints.get_mut(index) else {
+        return;
+    };
+    endpoint.checking_coder = false;
+    match status {
+        CoderWorkspaceStatus::Running => {
+            endpoint.preflight_ready = true;
+            endpoint.error = None;
+            endpoint.retry_at = Instant::now();
+        }
+        CoderWorkspaceStatus::Stopped(error) => endpoint.park(error),
+        CoderWorkspaceStatus::Unavailable(error) => endpoint.defer_preflight(error),
     }
 }
 
@@ -511,6 +693,7 @@ fn bridge_ready(
             endpoint.socket = Some(bridge.client_socket().to_path_buf());
             endpoint.bridge_status = Some(bridge.status());
             endpoint.bridge = Some(bridge);
+            endpoint.preflight_ready = true;
             endpoint.error = None;
             endpoint.retry_at = Instant::now();
             endpoint.retry_delay = RETRY_INITIAL;
@@ -525,6 +708,10 @@ fn endpoint_ready(
     generation: u64,
     result: Result<(LocalStream, LocalStream), String>,
 ) {
+    let active_resize = (index == state.active)
+        .then(|| state.last_resize.clone())
+        .flatten();
+    let event_tx = state.tx.clone();
     let Some(endpoint) = state.endpoints.get_mut(index) else {
         return;
     };
@@ -533,8 +720,21 @@ fn endpoint_ready(
     }
     match result {
         Ok((writer, mut reader)) => {
+            let writer = match EndpointWriter::start(writer, index, generation, event_tx.clone()) {
+                Ok(writer) => writer,
+                Err(error) => {
+                    endpoint.fail(error.to_string());
+                    return;
+                }
+            };
+            if let Some(resize) = active_resize {
+                if let Err(error) = writer.send(&resize) {
+                    endpoint.fail(error.to_string());
+                    return;
+                }
+            }
             endpoint.connected(writer);
-            let tx = state.tx.clone();
+            let tx = event_tx;
             std::thread::spawn(move || loop {
                 match protocol::read_message(&mut reader, MAX_GRAPHICS_FRAME_SIZE) {
                     Ok(message) => {
@@ -567,12 +767,20 @@ fn endpoint_ready(
 fn refresh_bridge_errors(state: &mut State) -> io::Result<()> {
     let mut changed = false;
     for endpoint in &mut state.endpoints {
-        let next = endpoint
+        let client_error = endpoint
             .bridge_status
             .as_ref()
             .and_then(|status| status.client_error());
-        if next.is_some() && next != endpoint.error {
-            endpoint.error = next;
+        if endpoint.writer.is_none() && client_error.is_some() && client_error != endpoint.error {
+            endpoint.error = client_error;
+            changed = true;
+        }
+        let agent_error = endpoint
+            .bridge_status
+            .as_ref()
+            .and_then(|status| status.agent_error());
+        if agent_error != endpoint.agent_error {
+            endpoint.agent_error = agent_error;
             changed = true;
         }
     }
@@ -585,7 +793,6 @@ fn refresh_bridge_errors(state: &mut State) -> io::Result<()> {
 fn handle_client_message(state: &mut State, message: ClientMessage) -> io::Result<bool> {
     match message {
         ClientMessage::Detach => {
-            broadcast(state, &ClientMessage::Detach);
             return Ok(true);
         }
         ClientMessage::ClientShellResize { .. } => {
@@ -629,7 +836,7 @@ fn handle_client_message(state: &mut State, message: ClientMessage) -> io::Resul
                 )?;
             }
         }
-        ClientMessage::ClientShellEndpointRequest { request, .. } => {
+        ClientMessage::ClientShellEndpointRequest { boot_id, request } => {
             match rewrite_request(state, &request) {
                 Ok((index, request)) => {
                     switch_active(state, index)?;
@@ -648,13 +855,9 @@ fn handle_client_message(state: &mut State, message: ClientMessage) -> io::Resul
                     )?;
                 }
                 Err(index) => {
-                    state.endpoints[index].enable_live_retry();
-                    if state.active == index {
-                        send_projection(state)?;
-                    } else {
-                        switch_active(state, index)?;
-                    }
-                    show_error(state, index)?;
+                    state.endpoints[index].enable_retry();
+                    send_projection(state)?;
+                    complete_unavailable_request(state, boot_id, &request, index)?;
                 }
             }
         }
@@ -817,7 +1020,14 @@ fn merged_snapshot(state: &State) -> ClientShellSnapshot {
                 let mut item = item.clone();
                 item.workspace_id = namespace(endpoint_id, &item.workspace_id);
                 item.active_tab_id = namespace(endpoint_id, &item.active_tab_id);
-                item.label = format!("{} · {}", endpoint.definition.name, item.label);
+                item.label = if let Some(agent_error) = endpoint.agent_error.as_deref() {
+                    format!(
+                        "{} · {agent_error} · {}",
+                        endpoint.definition.name, item.label
+                    )
+                } else {
+                    format!("{} · {}", endpoint.definition.name, item.label)
+                };
                 item.focused = index == state.active && item.focused;
                 merged.workspaces.push(item);
             }
@@ -841,6 +1051,11 @@ fn merged_snapshot(state: &State) -> ClientShellSnapshot {
                 item.pane_id = namespace(endpoint_id, &item.pane_id);
                 item.workspace_id = namespace(endpoint_id, &item.workspace_id);
                 item.tab_id = namespace(endpoint_id, &item.tab_id);
+                item.tokens.retain(|(name, _)| name != FLEET_INSTANCE_TOKEN);
+                item.tokens.push((
+                    FLEET_INSTANCE_TOKEN.to_owned(),
+                    endpoint.definition.name.clone(),
+                ));
                 item.focused = index == state.active && item.focused;
                 merged.agents.push(item);
             }
@@ -951,6 +1166,31 @@ fn show_error(state: &mut State, index: usize) -> io::Result<()> {
     )
 }
 
+fn complete_unavailable_request(
+    state: &mut State,
+    boot_id: String,
+    request: &str,
+    index: usize,
+) -> io::Result<()> {
+    let request_id = serde_json::from_str::<crate::api::schema::Request>(request)
+        .map(|request| request.id)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let endpoint = &state.endpoints[index];
+    let message = endpoint
+        .error
+        .clone()
+        .unwrap_or_else(|| format!("{} is reconnecting", endpoint.definition.name));
+    write_server(
+        &mut state.client,
+        &crate::server::client_commands::error_message(
+            boot_id,
+            request_id,
+            "server_unavailable",
+            message,
+        ),
+    )
+}
+
 fn send_to_active(state: &mut State, message: &ClientMessage) -> io::Result<()> {
     send_to(state, state.active, message)
 }
@@ -958,9 +1198,9 @@ fn send_to_active(state: &mut State, message: &ClientMessage) -> io::Result<()> 
 fn send_to(state: &mut State, index: usize, message: &ClientMessage) -> io::Result<()> {
     let result = state
         .endpoints
-        .get_mut(index)
-        .and_then(|endpoint| endpoint.writer.as_mut())
-        .map(|writer| write_client(writer, message));
+        .get(index)
+        .and_then(|endpoint| endpoint.writer.as_ref())
+        .map(|writer| writer.send(message));
     match result {
         Some(Ok(())) => Ok(()),
         Some(Err(error)) => {
@@ -973,8 +1213,16 @@ fn send_to(state: &mut State, index: usize, message: &ClientMessage) -> io::Resu
 
 fn broadcast(state: &mut State, message: &ClientMessage) {
     for endpoint in &mut state.endpoints {
-        if let Some(writer) = endpoint.writer.as_mut() {
-            let _ = write_client(writer, message);
+        if let Some(writer) = endpoint.writer.as_ref() {
+            let _ = writer.send(message);
+        }
+    }
+}
+
+fn detach_all(state: &mut State) {
+    for endpoint in &mut state.endpoints {
+        if let Some(writer) = endpoint.writer.take() {
+            writer.finish_gracefully(&ClientMessage::Detach);
         }
     }
 }
@@ -1068,6 +1316,20 @@ fn prefix(endpoint_id: &str) -> String {
 }
 fn namespace(endpoint_id: &str, id: &str) -> String {
     format!("{}{id}", prefix(endpoint_id))
+}
+
+pub(super) fn agent_endpoint_is_unavailable(snapshot: &ClientShellSnapshot, pane_id: &str) -> bool {
+    let Some(rest) = pane_id.strip_prefix("fleet/") else {
+        return false;
+    };
+    let Some((endpoint_id, _)) = rest.split_once('/') else {
+        return false;
+    };
+    let connection_workspace = namespace(endpoint_id, CONNECTION_WORKSPACE_ID);
+    snapshot
+        .workspaces
+        .iter()
+        .any(|workspace| workspace.workspace_id == connection_workspace)
 }
 
 fn namespace_surface(
@@ -1193,7 +1455,7 @@ mod tests {
     }
 
     #[test]
-    fn initial_connection_retries_once_then_waits_for_user() {
+    fn connection_attempts_continue_until_parked() {
         let mut endpoint = endpoint();
 
         assert!(endpoint.begin_attempt());
@@ -1201,27 +1463,11 @@ mod tests {
         assert!(!endpoint.waiting_for_user());
 
         assert!(endpoint.begin_attempt());
-        endpoint.fail("second".to_owned());
+        endpoint.park("stopped".to_owned());
         assert!(endpoint.waiting_for_user());
         assert!(!endpoint.begin_attempt());
-    }
 
-    #[test]
-    fn user_retry_and_post_connection_reconnect_are_live() {
-        let mut endpoint = endpoint();
-        assert!(endpoint.begin_attempt());
-        endpoint.fail("first".to_owned());
-        assert!(endpoint.begin_attempt());
-        endpoint.fail("second".to_owned());
-
-        endpoint.enable_live_retry();
-        assert!(endpoint.begin_attempt());
-        endpoint.fail("manual".to_owned());
-        assert!(endpoint.begin_attempt());
-
-        endpoint.live_retry = false;
-        endpoint.ever_connected = true;
-        endpoint.attempt_in_progress = false;
+        endpoint.enable_retry();
         assert!(endpoint.begin_attempt());
     }
 

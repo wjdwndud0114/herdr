@@ -2,6 +2,8 @@ use super::*;
 
 /// Run the headless server. This is the entry point called from main.rs.
 pub fn run_server() -> io::Result<()> {
+    #[cfg(unix)]
+    crate::remote::activate_remote_agent_environment()?;
     init_logging();
     crate::platform::raise_server_nofile_limit();
 

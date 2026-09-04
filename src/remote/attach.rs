@@ -13,7 +13,7 @@ use interprocess::local_socket::ListenerNonblockingMode;
 use interprocess::TryClone as _;
 use serde::Deserialize;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
@@ -172,12 +172,21 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         remote.keybindings,
         remote.live_handoff,
     );
-    let manage_ssh_config = crate::config::Config::load()
-        .config
-        .remote
-        .manage_ssh_config;
-    let remote_ssh = RemoteSsh::new(remote.target.clone(), manage_ssh_config);
+    let remote_config = &crate::config::Config::load().config.remote;
+    let remote_ssh = RemoteSsh::new(
+        remote.target.clone(),
+        remote_config.manage_ssh_config,
+        remote_config.forward_agent,
+    );
     let prepared_remote = prepare_remote_herdr(&remote_ssh, remote.live_handoff)?;
+    let agent_migration =
+        prepare_remote_agent_relay(&remote_ssh, &prepared_remote.remote_herdr, &session_name)?;
+    ensure_remote_agent_relay_server(
+        &remote_ssh,
+        &prepared_remote.remote_herdr,
+        &session_name,
+        agent_migration,
+    )?;
     ensure_remote_server_ready(
         &remote_ssh,
         &prepared_remote.remote_herdr,
@@ -188,11 +197,17 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
 
     let _bridge = SshStdioBridge::start(
         remote.target,
-        prepared_remote.remote_herdr,
+        prepared_remote.remote_herdr.clone(),
         local_socket.clone(),
-        session_name,
+        session_name.clone(),
         remote_ssh.options(),
     )?;
+    #[cfg(unix)]
+    let _agent_provider = SshAgentProvider::start(
+        &remote_ssh,
+        prepared_remote.remote_herdr.clone(),
+        session_name.clone(),
+    );
 
     run_client_process(&local_socket, &reattach_command, remote.keybindings)
 }
@@ -428,10 +443,11 @@ impl Drop for ManagedSshConfig {
 struct RemoteSsh {
     target: String,
     managed_config: Option<ManagedSshConfig>,
+    forward_agent: bool,
 }
 
 impl RemoteSsh {
-    fn new(target: String, manage_ssh_config: bool) -> Self {
+    fn new(target: String, manage_ssh_config: bool, forward_agent: bool) -> Self {
         let managed_config = if manage_ssh_config {
             write_managed_ssh_config()
                 .inspect_err(|err| {
@@ -445,6 +461,7 @@ impl RemoteSsh {
         Self {
             target,
             managed_config,
+            forward_agent,
         }
     }
 
@@ -465,6 +482,7 @@ impl RemoteSsh {
     fn base_command(&self) -> Command {
         let mut command = Command::new("ssh");
         apply_managed_ssh_options(&mut command, self.options());
+        command.arg("-a");
         command
     }
 
@@ -626,6 +644,23 @@ fn apply_managed_ssh_options(command: &mut Command, options: Option<&ManagedSshO
             .arg("-o")
             .arg("ControlPersist=yes");
     }
+}
+
+fn apply_bridge_liveness_options(command: &mut Command) {
+    command.args([
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=10",
+        "-o",
+        "ConnectionAttempts=1",
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=3",
+        "-o",
+        "TCPKeepAlive=yes",
+    ]);
 }
 
 impl InstallSource {
@@ -1045,6 +1080,7 @@ fn ensure_remote_server_ready(
         endpoint_protocol_generation,
         live_handoff,
         detached_server_daemon,
+        ..
     } = status
     else {
         return Ok(());
@@ -1135,6 +1171,7 @@ fn confirm_remote_install_with_running_server(
         endpoint_protocol_generation,
         live_handoff,
         detached_server_daemon,
+        ..
     } = &status
     else {
         return Ok(false);
@@ -1768,6 +1805,7 @@ impl SshStdioBridge {
         let thread_stop = Arc::clone(&should_stop);
         let last_error = Arc::new(Mutex::new(None));
         let thread_error = Arc::clone(&last_error);
+        let active_generation = Arc::new(AtomicU64::new(0));
         let thread_ssh_options = ssh_options.cloned();
         let thread = thread::spawn(move || {
             let mut connections: Vec<JoinHandle<()>> = Vec::new();
@@ -1784,19 +1822,31 @@ impl SshStdioBridge {
 
                 match listener.accept() {
                     Ok(stream) => {
+                        let generation = active_generation.fetch_add(1, Ordering::AcqRel) + 1;
                         let connection_target = target.clone();
                         let connection_herdr = remote_herdr.clone();
                         let connection_session = session_name.clone();
                         let connection_ssh_options = thread_ssh_options.clone();
                         let connection_stop = Arc::clone(&thread_stop);
                         let connection_error = Arc::clone(&thread_error);
+                        let connection_generation = Arc::clone(&active_generation);
                         connections.push(thread::spawn(move || {
-                            set_bridge_error(&connection_error, None);
+                            set_bridge_error_if_current(
+                                &connection_error,
+                                &connection_generation,
+                                generation,
+                                None,
+                            );
                             let stream = match prepare_remote_bridge_stream(stream) {
                                 Ok(stream) => stream,
                                 Err(err) => {
                                     let message = err.to_string();
-                                    set_bridge_error(&connection_error, Some(message.clone()));
+                                    set_bridge_error_if_current(
+                                        &connection_error,
+                                        &connection_generation,
+                                        generation,
+                                        Some(message.clone()),
+                                    );
                                     if report_errors_to_terminal {
                                         eprintln!(
                                             "remote bridge failed to prepare client socket: {err}"
@@ -1819,7 +1869,12 @@ impl SshStdioBridge {
                                 endpoint,
                             ) {
                                 let message = err.to_string();
-                                set_bridge_error(&connection_error, Some(message));
+                                set_bridge_error_if_current(
+                                    &connection_error,
+                                    &connection_generation,
+                                    generation,
+                                    Some(message),
+                                );
                                 if report_errors_to_terminal {
                                     eprintln!("remote bridge connection failed: {err}");
                                 }
@@ -1864,6 +1919,17 @@ fn set_bridge_error(slot: &Mutex<Option<String>>, error: Option<String>) {
     *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = error;
 }
 
+fn set_bridge_error_if_current(
+    slot: &Mutex<Option<String>>,
+    active_generation: &AtomicU64,
+    generation: u64,
+    error: Option<String>,
+) {
+    if active_generation.load(Ordering::Acquire) == generation {
+        set_bridge_error(slot, error);
+    }
+}
+
 fn bridge_error(slot: &Mutex<Option<String>>) -> Option<String> {
     slot.lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1890,10 +1956,241 @@ impl Drop for SshStdioBridge {
     }
 }
 
+#[cfg(unix)]
+#[derive(Clone, PartialEq, Eq)]
+struct LocalAgentIdentity {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+enum LocalAgentError {
+    Missing,
+    Stale,
+}
+
+#[cfg(unix)]
+fn local_agent_identity() -> Result<LocalAgentIdentity, LocalAgentError> {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+
+    let path = std::env::var_os("SSH_AUTH_SOCK")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .ok_or(LocalAgentError::Missing)?;
+    let metadata = fs::metadata(&path).map_err(|_| LocalAgentError::Stale)?;
+    if !metadata.file_type().is_socket() || metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(LocalAgentError::Stale);
+    }
+    Ok(LocalAgentIdentity {
+        path,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(unix)]
+struct SshAgentProvider {
+    stop: Arc<AtomicBool>,
+    last_error: Arc<Mutex<Option<String>>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl SshAgentProvider {
+    fn start(ssh: &RemoteSsh, remote_herdr: RemoteHerdr, session_name: String) -> Option<Self> {
+        if !ssh.forward_agent {
+            return None;
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let last_error = Arc::new(Mutex::new(Some(
+            "SSH agent provider bridge is connecting".to_owned(),
+        )));
+        let thread_stop = Arc::clone(&stop);
+        let thread_error = Arc::clone(&last_error);
+        let target = ssh.target.clone();
+        let options = ssh.options().cloned();
+        let thread = thread::spawn(move || {
+            run_agent_provider_loop(
+                &target,
+                &remote_herdr,
+                &session_name,
+                options.as_ref(),
+                &thread_stop,
+                &thread_error,
+            );
+        });
+        Some(Self {
+            stop,
+            last_error,
+            thread: Some(thread),
+        })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SshAgentProvider {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn run_agent_provider_loop(
+    target: &str,
+    remote_herdr: &RemoteHerdr,
+    session_name: &str,
+    ssh_options: Option<&ManagedSshOptions>,
+    stop: &AtomicBool,
+    last_error: &Mutex<Option<String>>,
+) {
+    use std::io::BufRead as _;
+
+    const MAX_RETRY: Duration = Duration::from_secs(2);
+    let mut retry = Duration::from_millis(250);
+    while !stop.load(Ordering::Acquire) {
+        let identity = match local_agent_identity() {
+            Ok(identity) => identity,
+            Err(LocalAgentError::Missing) => {
+                set_bridge_error(
+                    last_error,
+                    Some("SSH agent forwarding enabled but no local agent is available".to_owned()),
+                );
+                sleep_until_retry(stop, retry);
+                retry = retry.saturating_mul(2).min(MAX_RETRY);
+                continue;
+            }
+            Err(LocalAgentError::Stale) => {
+                set_bridge_error(
+                    last_error,
+                    Some("local SSH agent socket became stale".to_owned()),
+                );
+                sleep_until_retry(stop, retry);
+                retry = retry.saturating_mul(2).min(MAX_RETRY);
+                continue;
+            }
+        };
+
+        let mut command = Command::new("ssh");
+        apply_managed_ssh_options(&mut command, ssh_options);
+        apply_bridge_liveness_options(&mut command);
+        command
+            .arg("-S")
+            .arg("none")
+            .args(["-o", "ControlMaster=no", "-o", "ControlPersist=no"])
+            .arg("-A")
+            .arg("-T")
+            .arg(target)
+            .arg(remote_internal_command(
+                remote_herdr,
+                session_name,
+                "remote-agent-provider",
+            ))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                set_bridge_error(
+                    last_error,
+                    Some(format!("SSH agent provider bridge disconnected: {error}")),
+                );
+                sleep_until_retry(stop, retry);
+                retry = retry.saturating_mul(2).min(MAX_RETRY);
+                continue;
+            }
+        };
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        if let Some(stdout) = child.stdout.take() {
+            thread::spawn(move || {
+                let mut line = String::new();
+                let result = std::io::BufReader::new(stdout).read_line(&mut line);
+                let _ = ready_tx.send(result.map(|_| line));
+            });
+        }
+        let stderr_reader = spawn_bridge_stderr_reader(child.stderr.take());
+        let mut ready = false;
+        let mut local_stale = false;
+        loop {
+            if stop.load(Ordering::Acquire) {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = join_bridge_stderr_reader(stderr_reader);
+                return;
+            }
+            if !matches!(local_agent_identity(), Ok(current) if current == identity) {
+                local_stale = true;
+                let _ = child.kill();
+            }
+            match ready_rx.try_recv() {
+                Ok(Ok(line)) if line.trim() == "ready" => {
+                    ready = true;
+                    retry = Duration::from_millis(250);
+                    set_bridge_error(last_error, None);
+                }
+                Ok(Ok(_)) | Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let stderr = join_bridge_stderr_reader(stderr_reader);
+                    let detail = String::from_utf8_lossy(&stderr).trim().to_owned();
+                    let message = if local_stale {
+                        "local SSH agent socket became stale; restarting provider".to_owned()
+                    } else if detail.contains("no forwarded SSH agent was supplied") {
+                        "SSH agent forwarding was not accepted by the remote host".to_owned()
+                    } else if detail.contains("remote stable SSH-agent endpoint unavailable") {
+                        "remote stable SSH-agent endpoint unavailable".to_owned()
+                    } else if detail.is_empty() {
+                        format!("SSH agent provider bridge disconnected: {status}")
+                    } else {
+                        tracing::debug!(%detail, "SSH agent provider exited");
+                        format!("SSH agent provider bridge disconnected: {status}")
+                    };
+                    set_bridge_error(last_error, Some(message));
+                    break;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = join_bridge_stderr_reader(stderr_reader);
+                    set_bridge_error(
+                        last_error,
+                        Some(format!("SSH agent provider bridge disconnected: {error}")),
+                    );
+                    break;
+                }
+            }
+            thread::sleep(if ready {
+                Duration::from_millis(250)
+            } else {
+                Duration::from_millis(50)
+            });
+        }
+        sleep_until_retry(stop, retry);
+        retry = retry.saturating_mul(2).min(MAX_RETRY);
+    }
+}
+
+#[cfg(unix)]
+fn sleep_until_retry(stop: &AtomicBool, delay: Duration) {
+    let deadline = Instant::now() + delay;
+    while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Paired client/API tunnels used by the local multi-instance presentation client.
 pub(crate) struct FleetRemoteBridge {
     client: SshStdioBridge,
     api: SshStdioBridge,
+    #[cfg(unix)]
+    agent_provider: Option<SshAgentProvider>,
     // Keep the managed SSH config and control socket alive until both tunnels stop.
     _remote_ssh: RemoteSsh,
 }
@@ -1902,6 +2199,8 @@ pub(crate) struct FleetRemoteBridge {
 pub(crate) struct FleetRemoteBridgeStatus {
     client_error: Arc<Mutex<Option<String>>>,
     api_error: Arc<Mutex<Option<String>>>,
+    #[cfg(unix)]
+    agent_error: Option<Arc<Mutex<Option<String>>>>,
 }
 
 impl FleetRemoteBridgeStatus {
@@ -1911,6 +2210,17 @@ impl FleetRemoteBridgeStatus {
 
     pub(crate) fn api_error(&self) -> Option<String> {
         bridge_error(&self.api_error)
+    }
+
+    pub(crate) fn agent_error(&self) -> Option<String> {
+        #[cfg(unix)]
+        {
+            self.agent_error.as_deref().and_then(bridge_error)
+        }
+        #[cfg(windows)]
+        {
+            None
+        }
     }
 }
 
@@ -1927,6 +2237,11 @@ impl FleetRemoteBridge {
         FleetRemoteBridgeStatus {
             client_error: Arc::clone(&self.client.last_error),
             api_error: Arc::clone(&self.api.last_error),
+            #[cfg(unix)]
+            agent_error: self
+                .agent_provider
+                .as_ref()
+                .map(|provider| Arc::clone(&provider.last_error)),
         }
     }
 }
@@ -1948,12 +2263,21 @@ fn start_fleet_remote_bridge_inner(
     validate_remote_target(target)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
     let session_name = session.unwrap_or(crate::session::DEFAULT_SESSION_NAME);
-    let manage_ssh_config = crate::config::Config::load()
-        .config
-        .remote
-        .manage_ssh_config;
-    let remote_ssh = RemoteSsh::new(target.to_string(), manage_ssh_config);
+    let remote_config = &crate::config::Config::load().config.remote;
+    let remote_ssh = RemoteSsh::new(
+        target.to_string(),
+        remote_config.manage_ssh_config,
+        remote_config.forward_agent,
+    );
     let prepared_remote = prepare_fleet_remote_herdr(&remote_ssh)?;
+    let agent_migration =
+        prepare_remote_agent_relay(&remote_ssh, &prepared_remote.remote_herdr, session_name)?;
+    ensure_remote_agent_relay_server(
+        &remote_ssh,
+        &prepared_remote.remote_herdr,
+        session_name,
+        agent_migration,
+    )?;
     ensure_remote_server_ready(
         &remote_ssh,
         &prepared_remote.remote_herdr,
@@ -1977,19 +2301,130 @@ fn start_fleet_remote_bridge_inner(
     )?;
     let api = SshStdioBridge::start_endpoint(
         target.to_string(),
-        prepared_remote.remote_herdr,
+        prepared_remote.remote_herdr.clone(),
         api_socket,
         session_name.to_string(),
         remote_ssh.options(),
         RemoteBridgeEndpoint::Api,
         false,
     )?;
+    #[cfg(unix)]
+    let agent_provider = SshAgentProvider::start(
+        &remote_ssh,
+        prepared_remote.remote_herdr.clone(),
+        session_name.to_string(),
+    );
 
     Ok(FleetRemoteBridge {
         client,
         api,
+        #[cfg(unix)]
+        agent_provider,
         _remote_ssh: remote_ssh,
     })
+}
+
+fn remote_internal_command(
+    remote_herdr: &RemoteHerdr,
+    session_name: &str,
+    command: &str,
+) -> String {
+    let mut value = remote_herdr.shell_path.clone();
+    if session_name != crate::session::DEFAULT_SESSION_NAME {
+        value.push_str(" --session ");
+        value.push_str(&shell_quote(session_name));
+    }
+    value.push(' ');
+    value.push_str(command);
+    value
+}
+
+fn prepare_remote_agent_relay(
+    ssh: &RemoteSsh,
+    remote_herdr: &RemoteHerdr,
+    session_name: &str,
+) -> io::Result<bool> {
+    if !ssh.forward_agent {
+        tracing::debug!(target = %ssh.target(), "SSH agent forwarding disabled");
+        let command = remote_internal_command(remote_herdr, session_name, "remote-agent-disable");
+        let output = ssh.user_shell_output(&command)?;
+        return if output.status.success() {
+            Ok(false)
+        } else {
+            Err(command_failed(
+                "could not disable remote SSH-agent forwarding",
+                &output,
+            ))
+        };
+    }
+    let command = remote_internal_command(remote_herdr, session_name, "remote-agent-prepare");
+    let output = ssh.user_shell_output(&command)?;
+    if !output.status.success() {
+        return Err(command_failed(
+            "remote stable SSH-agent endpoint unavailable",
+            &output,
+        ));
+    }
+    let command =
+        remote_internal_command(remote_herdr, session_name, "remote-agent-migration-status");
+    let output = ssh.user_shell_output(&command)?;
+    if !output.status.success() {
+        return Err(command_failed(
+            "could not determine remote SSH-agent migration status",
+            &output,
+        ));
+    }
+    match String::from_utf8_lossy(&output.stdout).trim() {
+        "needed" => Ok(true),
+        "complete" => Ok(false),
+        status => Err(io::Error::other(format!(
+            "invalid remote SSH-agent migration status: {status}"
+        ))),
+    }
+}
+
+fn ensure_remote_agent_relay_server(
+    ssh: &RemoteSsh,
+    remote_herdr: &RemoteHerdr,
+    session_name: &str,
+    migration_needed: bool,
+) -> io::Result<()> {
+    if !ssh.forward_agent || !migration_needed {
+        return Ok(());
+    }
+    let migrated_running_server = match remote_server_status(ssh, remote_herdr)? {
+        RemoteServerStatus::Running {
+            live_handoff: true, ..
+        } => {
+            live_handoff_remote_server(ssh, remote_herdr)?;
+            true
+        }
+        RemoteServerStatus::Running { .. } => {
+            return Err(io::Error::other(
+                "remote server requires a one-time restart to enable durable SSH-agent forwarding",
+            ));
+        }
+        RemoteServerStatus::NotRunning => false,
+    };
+    let command = remote_internal_command(
+        remote_herdr,
+        session_name,
+        "remote-agent-migration-complete",
+    );
+    let output = ssh.user_shell_output(&command)?;
+    if !output.status.success() {
+        return Err(command_failed(
+            "could not complete remote SSH-agent migration",
+            &output,
+        ));
+    }
+    if migrated_running_server {
+        eprintln!(
+            "existing panes on {} retain their previous SSH_AUTH_SOCK; recreate each pane once or export the session's stable ssh-agent/agent.sock path in its shell",
+            ssh.target()
+        );
+    }
+    Ok(())
 }
 
 fn ssh_config_quote(path: &str) -> String {
@@ -2065,7 +2500,9 @@ fn bridge_connection(
     stream.set_nonblocking(false)?;
     let mut command = Command::new("ssh");
     apply_managed_ssh_options(&mut command, ssh_options);
+    apply_bridge_liveness_options(&mut command);
     command
+        .arg("-a")
         .arg("-T")
         .arg(target)
         .arg(remote_endpoint_bridge_command(
@@ -2138,7 +2575,9 @@ fn bridge_connection(
 ) -> io::Result<()> {
     let mut command = Command::new("ssh");
     apply_managed_ssh_options(&mut command, ssh_options);
+    apply_bridge_liveness_options(&mut command);
     command
+        .arg("-a")
         .arg("-T")
         .arg(target)
         .arg(remote_endpoint_bridge_command(
@@ -2662,6 +3101,7 @@ mod tests {
         let ssh = RemoteSsh {
             target: "example".to_string(),
             managed_config: Some(managed_config),
+            forward_agent: false,
         };
 
         let command = ssh.command();
@@ -2681,6 +3121,7 @@ mod tests {
                 "ControlMaster=auto".to_string(),
                 "-o".to_string(),
                 "ControlPersist=yes".to_string(),
+                "-a".to_string(),
                 "-T".to_string(),
                 "example".to_string(),
             ]
@@ -2700,6 +3141,7 @@ mod tests {
         let ssh = RemoteSsh {
             target: "example".to_string(),
             managed_config: Some(managed_config),
+            forward_agent: false,
         };
         let args = ssh
             .command()
@@ -2711,6 +3153,7 @@ mod tests {
             vec![
                 "-F".to_string(),
                 config_path.to_string_lossy().into_owned(),
+                "-a".to_string(),
                 "-T".to_string(),
                 "example".to_string(),
             ]
@@ -2731,6 +3174,7 @@ mod tests {
         let ssh = RemoteSsh {
             target: "example".to_string(),
             managed_config: None,
+            forward_agent: false,
         };
 
         let command = ssh.command();
@@ -2739,7 +3183,10 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
 
-        assert_eq!(args, vec!["-T".to_string(), "example".to_string()]);
+        assert_eq!(
+            args,
+            vec!["-a".to_string(), "-T".to_string(), "example".to_string()]
+        );
     }
 
     #[test]
@@ -3219,7 +3666,7 @@ mod tests {
                 version: Some("0.6.0".into()),
                 endpoint_protocol_generation: Some(1),
                 live_handoff: true,
-                detached_server_daemon: true
+                detached_server_daemon: true,
             }
         );
     }
@@ -3235,7 +3682,7 @@ mod tests {
                 version: Some("0.6.0".into()),
                 endpoint_protocol_generation: None,
                 live_handoff: false,
-                detached_server_daemon: false
+                detached_server_daemon: false,
             }
         );
     }

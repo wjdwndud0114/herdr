@@ -1211,12 +1211,16 @@ impl ClientShellState {
         let pinned_count = self.pinned_agents.len();
         let unread_count = self.unread_agents.len();
         let order_count = self.agent_manual_order.len();
+        let retain_agent_preference = |pane_id: &str| {
+            live_agents.contains(pane_id)
+                || crate::client::fleet::agent_endpoint_is_unavailable(&snapshot, pane_id)
+        };
         self.pinned_agents
-            .retain(|pane_id| live_agents.contains(pane_id.as_str()));
+            .retain(|pane_id| retain_agent_preference(pane_id));
         self.unread_agents
-            .retain(|pane_id| live_agents.contains(pane_id.as_str()));
+            .retain(|pane_id| retain_agent_preference(pane_id));
         self.agent_manual_order
-            .retain(|pane_id| live_agents.contains(pane_id.as_str()));
+            .retain(|pane_id| retain_agent_preference(pane_id));
         if pinned_count != self.pinned_agents.len()
             || unread_count != self.unread_agents.len()
             || order_count != self.agent_manual_order.len()
@@ -1272,6 +1276,9 @@ impl ClientShellState {
                 .is_none_or(|surface| surface.projection_revision != snapshot.revision)
         {
             self.hits = ShellHitMap::default();
+        }
+        if snapshot.focused_pane_id.is_none() {
+            self.pane_surface = None;
         }
         if boot_changed {
             self.pane_surface = None;
