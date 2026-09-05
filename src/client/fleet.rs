@@ -16,7 +16,7 @@ use crate::protocol::endpoint::{
 };
 use crate::protocol::{
     self, ClientClipboardImageTarget, ClientMessage, ClientShellSnapshot, ClientShellWorkspace,
-    PaneSurfaceFrame, PaneSurfacePatch, ServerMessage, SurfaceGraphicsAssetKey,
+    ClientSurfaceSize, PaneSurfaceFrame, PaneSurfacePatch, ServerMessage, SurfaceGraphicsAssetKey,
     SurfaceGraphicsSource, SurfaceGraphicsTarget, MAX_GRAPHICS_FRAME_SIZE,
 };
 
@@ -309,6 +309,7 @@ struct State {
     revision: u64,
     hello: ClientMessage,
     last_resize: Option<ClientMessage>,
+    surface_size: ClientSurfaceSize,
     client: LocalStream,
     tx: mpsc::Sender<Event>,
     stop: Arc<AtomicBool>,
@@ -339,6 +340,8 @@ fn run_proxy(listener: LocalListener, stop: Arc<AtomicBool>) -> io::Result<()> {
     if rejection.is_some() {
         return Ok(());
     }
+    let surface_size =
+        endpoint_surface_size(&hello).unwrap_or(ClientSurfaceSize { cols: 1, rows: 1 });
 
     let registry = crate::fleet::load();
     let mut definitions = vec![Definition {
@@ -382,6 +385,7 @@ fn run_proxy(listener: LocalListener, stop: Arc<AtomicBool>) -> io::Result<()> {
         revision: 0,
         hello,
         last_resize: None,
+        surface_size,
         client,
         tx,
         stop,
@@ -443,6 +447,15 @@ fn run_proxy(listener: LocalListener, stop: Arc<AtomicBool>) -> io::Result<()> {
     }
     detach_all(&mut state);
     Ok(())
+}
+
+fn endpoint_surface_size(hello: &ClientMessage) -> Option<ClientSurfaceSize> {
+    let ClientMessage::EndpointControl { data, .. } = hello else {
+        return None;
+    };
+    serde_json::from_str::<EndpointClientHello>(data)
+        .ok()
+        .map(|hello| hello.surface_size)
 }
 
 fn endpoint_hello_rejection(hello: &ClientMessage) -> Option<(String, String)> {
@@ -795,7 +808,8 @@ fn handle_client_message(state: &mut State, message: ClientMessage) -> io::Resul
         ClientMessage::Detach => {
             return Ok(true);
         }
-        ClientMessage::ClientShellResize { .. } => {
+        ClientMessage::ClientShellResize { surface_size, .. } => {
+            state.surface_size = surface_size;
             state.last_resize = Some(message.clone());
             send_to_active(state, &message)?;
         }
@@ -986,11 +1000,28 @@ fn send_projection(state: &mut State) -> io::Result<()> {
     let message = crate::protocol::endpoint::snapshot_message(&snapshot)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     write_server(&mut state.client, &message)?;
-    if let Some(surface) = state.endpoints[state.active].surface.clone() {
-        let surface = namespace_surface(state, state.active, surface);
-        write_server(&mut state.client, &ServerMessage::PaneSurface(surface))?;
-    }
+    let surface = state.endpoints[state.active]
+        .surface
+        .clone()
+        .map(|surface| namespace_surface(state, state.active, surface))
+        .unwrap_or_else(|| blank_surface(state.surface_size, state.revision));
+    write_server(&mut state.client, &ServerMessage::PaneSurface(surface))?;
     Ok(())
+}
+
+fn blank_surface(size: ClientSurfaceSize, projection_revision: u64) -> PaneSurfaceFrame {
+    let area = ratatui::layout::Rect::new(0, 0, size.cols.max(1), size.rows.max(1));
+    let buffer = ratatui::buffer::Buffer::empty(area);
+    PaneSurfaceFrame {
+        boot_id: FLEET_BOOT_ID.to_owned(),
+        projection_revision,
+        surface_revision: 0,
+        frame: crate::protocol::FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, None, &[]),
+        panes: Vec::new(),
+        splits: Vec::new(),
+        popup: None,
+        graphics: crate::protocol::SurfaceGraphicsScene::default(),
+    }
 }
 
 fn merged_snapshot(state: &State) -> ClientShellSnapshot {
