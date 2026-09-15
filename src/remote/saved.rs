@@ -1,10 +1,14 @@
 use std::io;
 use std::path::PathBuf;
 
+#[cfg(unix)]
+use super::attach::SshAgentProvider;
 use super::attach::{find_installed_remote_herdr, RemoteSsh, SshStdioBridge};
 
 pub(crate) struct SavedSshBridge {
     _bridge: SshStdioBridge,
+    #[cfg(unix)]
+    _agent_provider: Option<SshAgentProvider>,
 }
 
 pub(crate) struct SavedSshStream {
@@ -19,6 +23,8 @@ pub(crate) fn connect_saved_ssh(
 ) -> io::Result<SavedSshStream> {
     let ssh = validated_saved_ssh(profile_id, target, session)?;
     let remote_herdr = find_installed_remote_herdr(&ssh)?;
+    #[cfg(unix)]
+    let agent_provider = SshAgentProvider::start(&ssh, remote_herdr.clone(), session.to_owned());
     let path = saved_bridge_path(profile_id);
     let bridge = SshStdioBridge::start(
         target.to_owned(),
@@ -31,19 +37,28 @@ pub(crate) fn connect_saved_ssh(
     let stream = crate::ipc::connect_local_stream(&path)?;
     Ok(SavedSshStream {
         stream,
-        bridge: SavedSshBridge { _bridge: bridge },
+        bridge: SavedSshBridge {
+            _bridge: bridge,
+            #[cfg(unix)]
+            _agent_provider: agent_provider,
+        },
     })
 }
 
 pub(crate) struct SavedSshApiBridge {
     path: PathBuf,
     bridge: SshStdioBridge,
+    #[cfg(unix)]
+    _agent_provider: Option<SshAgentProvider>,
 }
 
 impl SavedSshApiBridge {
     pub(crate) fn start(profile_id: &str, target: &str, session: &str) -> io::Result<Self> {
         let ssh = validated_saved_ssh(profile_id, target, session)?;
         let remote_herdr = super::attach::find_installed_remote_api_herdr(&ssh, session)?;
+        #[cfg(unix)]
+        let agent_provider =
+            SshAgentProvider::start(&ssh, remote_herdr.clone(), session.to_owned());
         let command = super::attach::remote_api_bridge_command(&remote_herdr, session, false);
         let path = crate::platform::remote_bridge_endpoint_path(
             &format!("herdr-api-ssh-{}-{profile_id}.sock", std::process::id()),
@@ -60,7 +75,12 @@ impl SavedSshApiBridge {
             ssh.options(),
             true,
         )?;
-        Ok(Self { path, bridge })
+        Ok(Self {
+            path,
+            bridge,
+            #[cfg(unix)]
+            _agent_provider: agent_provider,
+        })
     }
 
     pub(crate) fn socket_path(&self) -> &std::path::Path {
@@ -118,7 +138,10 @@ fn validated_saved_ssh(profile_id: &str, target: &str, session: &str) -> io::Res
     validate_profile_path_id(profile_id)?;
     crate::session::validate_name(session)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-    Ok(RemoteSsh::new_noninteractive(target.to_owned()))
+    Ok(RemoteSsh::new_saved_noninteractive(
+        target.to_owned(),
+        session.to_owned(),
+    ))
 }
 
 fn validate_profile_path_id(profile_id: &str) -> io::Result<()> {

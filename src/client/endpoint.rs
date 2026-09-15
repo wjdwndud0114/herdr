@@ -68,7 +68,8 @@ impl fmt::Display for ProfileId {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
 pub(crate) enum ClientEndpointId {
     Local,
     Ssh(ProfileId),

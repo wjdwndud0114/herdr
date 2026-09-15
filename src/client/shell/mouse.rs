@@ -5,6 +5,47 @@ const SELECTION_AUTOSCROLL_INTERVAL: std::time::Duration = std::time::Duration::
 const SELECTION_REPAINT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 
 impl ClientShellState {
+    fn ordered_agent_keys(&self) -> Vec<preferences::ClientAgentPreferenceKey> {
+        super::aggregate_navigation::aggregate_agent_rows_with_preferences(
+            &self.endpoints,
+            &self.active_endpoint_id,
+            self.config.agent_panel_sort,
+            &self.pinned_agents,
+            &self.agent_manual_order,
+        )
+        .into_iter()
+        .map(|row| {
+            preferences::ClientAgentPreferenceKey::new(row.endpoint.endpoint_id, &row.agent.pane_id)
+        })
+        .collect()
+    }
+
+    fn agent_drop_index_at(&self, point: (u16, u16)) -> Option<usize> {
+        let ordered = self.ordered_agent_keys();
+        for (rect, endpoint_id, pane_id) in &self.hits.endpoint_agents {
+            let key = preferences::ClientAgentPreferenceKey::new(endpoint_id, pane_id);
+            let index = ordered.iter().position(|candidate| candidate == &key)?;
+            if point.1 < rect.y.saturating_add(rect.height.max(1) / 2) {
+                return Some(index);
+            }
+            if super::contains(*rect, point) {
+                return Some(index + 1);
+            }
+        }
+        super::contains(self.hits.agent_body, point).then_some(ordered.len())
+    }
+
+    fn reorder_agent(&mut self, key: &preferences::ClientAgentPreferenceKey, insert_index: usize) {
+        let mut ordered = self.ordered_agent_keys();
+        let Some(source) = ordered.iter().position(|candidate| candidate == key) else {
+            return;
+        };
+        let key = ordered.remove(source);
+        let target = insert_index.saturating_sub(usize::from(source < insert_index));
+        ordered.insert(target.min(ordered.len()), key);
+        self.agent_manual_order = ordered;
+    }
+
     fn set_sidebar_width_from_column(&mut self, column: u16, outcome: &mut ClientShellInput) {
         let (min, max) = crate::config::validated_sidebar_bounds(
             self.config.sidebar_min_width,
@@ -1169,7 +1210,32 @@ impl ClientShellState {
                     outcome.repaint = true;
                     return;
                 }
+                Some(ClientChromeDrag::Agent { .. }) => {
+                    let insert_index = self.agent_drop_index_at(point);
+                    if let Some(ClientChromeDrag::Agent {
+                        insert_index: current,
+                        ..
+                    }) = self.chrome_drag.as_mut()
+                    {
+                        *current = insert_index;
+                    }
+                    outcome.repaint = true;
+                    return;
+                }
                 None => {}
+            }
+            if let Some(press) = self.agent_press.as_ref() {
+                let delta = mouse
+                    .column
+                    .abs_diff(press.start_column)
+                    .max(mouse.row.abs_diff(press.start_row));
+                if delta >= 1 {
+                    let key = press.key.clone();
+                    let insert_index = self.agent_drop_index_at(point);
+                    self.chrome_drag = Some(ClientChromeDrag::Agent { key, insert_index });
+                    outcome.repaint = true;
+                }
+                return;
             }
             if let Some(press) = self.workspace_press.as_ref() {
                 let delta = mouse
@@ -1213,6 +1279,7 @@ impl ClientShellState {
             if let Some(drag) = self.chrome_drag.take() {
                 self.workspace_press = None;
                 self.tab_press = None;
+                self.agent_press = None;
                 match drag {
                     ClientChromeDrag::Tab {
                         tab_id,
@@ -1258,6 +1325,16 @@ impl ClientShellState {
                             ) {
                                 self.push_endpoint_method(method, outcome);
                             }
+                        }
+                        outcome.repaint = true;
+                    }
+                    ClientChromeDrag::Agent { key, insert_index } => {
+                        if let Some(insert_index) = insert_index {
+                            self.reorder_agent(&key, insert_index);
+                            self.config.agent_panel_sort =
+                                crate::config::AgentPanelSortConfig::Manual;
+                            self.agent_panel_sort_manual = true;
+                            self.persist_chrome_preferences(outcome);
                         }
                         outcome.repaint = true;
                     }
@@ -1320,6 +1397,10 @@ impl ClientShellState {
                     | ClientChromeDrag::ProductAnnouncementScrollbar { .. }
                     | ClientChromeDrag::ReleaseNotesScrollbar { .. } => {}
                 }
+                return;
+            }
+            if self.agent_press.take().is_some() {
+                self.handle_endpoint_agent_click(point, outcome);
                 return;
             }
             if let Some(press) = self.workspace_press.take() {
@@ -1889,6 +1970,7 @@ impl ClientShellState {
                 let previous_pane_click = self.last_pane_click.take();
                 self.workspace_press = None;
                 self.tab_press = None;
+                self.agent_press = None;
                 self.chrome_drag = None;
                 if super::contains(self.hits.sidebar_divider, point)
                     && !super::contains(self.hits.sidebar_toggle, point)
@@ -1964,12 +2046,43 @@ impl ClientShellState {
                     }
                     return;
                 }
+                let pin_target = self
+                    .hits
+                    .agent_pins
+                    .iter()
+                    .find(|(rect, _)| super::contains(*rect, point))
+                    .map(|(_, key)| key.clone());
+                if let Some(key) = pin_target {
+                    if !self.pinned_agents.remove(&key) {
+                        self.pinned_agents.insert(key);
+                    }
+                    self.persist_chrome_preferences(outcome);
+                    outcome.repaint = true;
+                    return;
+                }
+                let unread_target = self
+                    .hits
+                    .agent_unreads
+                    .iter()
+                    .find(|(rect, _)| super::contains(*rect, point))
+                    .map(|(_, key)| key.clone());
+                if let Some(key) = unread_target {
+                    if !self.unread_agents.remove(&key) {
+                        self.unread_agents.insert(key);
+                    }
+                    self.persist_chrome_preferences(outcome);
+                    outcome.repaint = true;
+                    return;
+                }
                 if super::contains(self.hits.agent_sort_toggle, point) {
                     let sort = match self.config.agent_panel_sort {
                         crate::config::AgentPanelSortConfig::Spaces => {
                             crate::config::AgentPanelSortConfig::Priority
                         }
                         crate::config::AgentPanelSortConfig::Priority => {
+                            crate::config::AgentPanelSortConfig::Manual
+                        }
+                        crate::config::AgentPanelSortConfig::Manual => {
                             crate::config::AgentPanelSortConfig::Spaces
                         }
                     };
@@ -2092,7 +2205,18 @@ impl ClientShellState {
                     self.tab_press = Some(tab_press);
                     return;
                 }
-                if self.handle_endpoint_agent_click(point, outcome) {
+                let agent_press = self
+                    .hits
+                    .endpoint_agents
+                    .iter()
+                    .find(|(rect, _, _)| super::contains(*rect, point))
+                    .map(|(_, endpoint_id, pane_id)| ClientAgentPress {
+                        key: preferences::ClientAgentPreferenceKey::new(endpoint_id, pane_id),
+                        start_column: mouse.column,
+                        start_row: mouse.row,
+                    });
+                if let Some(agent_press) = agent_press {
+                    self.agent_press = Some(agent_press);
                     return;
                 }
                 let agent_pane_id = self

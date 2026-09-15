@@ -16,7 +16,7 @@ use interprocess::TryClone as _;
 use serde::Deserialize;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    mpsc, Arc,
+    mpsc, Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -66,6 +66,14 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
     );
     let prepared_remote =
         prepare_remote_herdr(&remote_ssh, remote.live_handoff, require_surface_interest)?;
+    let agent_migration =
+        prepare_remote_agent_relay(&remote_ssh, &prepared_remote.remote_herdr, &session_name)?;
+    ensure_remote_agent_relay_server(
+        &remote_ssh,
+        &prepared_remote.remote_herdr,
+        &session_name,
+        agent_migration,
+    )?;
     ensure_remote_server_ready(
         &remote_ssh,
         &prepared_remote.remote_herdr,
@@ -73,6 +81,13 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         remote.live_handoff,
         require_surface_interest,
     )?;
+
+    #[cfg(unix)]
+    let _agent_provider = SshAgentProvider::start(
+        &remote_ssh,
+        prepared_remote.remote_herdr.clone(),
+        session_name.clone(),
+    );
 
     let _bridge = SshStdioBridge::start(
         remote.target,
@@ -101,6 +116,8 @@ pub(crate) fn prepare_saved_ssh(target: &str, session_name: &str) -> io::Result<
         session_name.to_owned(),
     );
     let prepared = prepare_remote_herdr(&ssh, false, true)?;
+    let agent_migration = prepare_remote_agent_relay(&ssh, &prepared.remote_herdr, session_name)?;
+    ensure_remote_agent_relay_server(&ssh, &prepared.remote_herdr, session_name, agent_migration)?;
     ensure_remote_server_ready(
         &ssh,
         &prepared.remote_herdr,
@@ -545,6 +562,7 @@ impl Drop for ManagedSshConfig {
 pub(super) struct RemoteSsh {
     target: String,
     session_name: String,
+    forward_agent: bool,
     managed_config: Option<ManagedSshConfig>,
     noninteractive: bool,
 }
@@ -565,15 +583,28 @@ impl RemoteSsh {
             target,
             session_name,
             managed_config,
+            forward_agent: crate::config::Config::load().config.remote.forward_agent,
             noninteractive: false,
         }
     }
 
+    #[cfg(test)]
     pub(super) fn new_noninteractive(target: String) -> Self {
         Self {
             target,
             session_name: crate::session::DEFAULT_SESSION_NAME.into(),
             managed_config: None,
+            forward_agent: crate::config::Config::load().config.remote.forward_agent,
+            noninteractive: true,
+        }
+    }
+
+    pub(super) fn new_saved_noninteractive(target: String, session_name: String) -> Self {
+        Self {
+            target,
+            session_name,
+            managed_config: None,
+            forward_agent: crate::config::Config::load().config.remote.forward_agent,
             noninteractive: true,
         }
     }
@@ -602,6 +633,7 @@ impl RemoteSsh {
     fn base_command(&self) -> Command {
         let mut command = Command::new("ssh");
         apply_managed_ssh_options(&mut command, self.options());
+        command.arg("-a");
         command
     }
 
@@ -1007,6 +1039,8 @@ fn apply_noninteractive_ssh_options(command: &mut Command) {
         .arg("-o")
         .arg("NumberOfPasswordPrompts=0")
         .arg("-o")
+        .arg("UserKnownHostsFile=~/.ssh/known_hosts")
+        .arg("-o")
         .arg("StrictHostKeyChecking=yes")
         .arg("-o")
         .arg("ConnectTimeout=10")
@@ -1099,6 +1133,7 @@ pub(super) fn prepare_remote_herdr(
         for candidate in &remote_binary_candidates {
             if remote_binary_supports_endpoint_requirement(ssh, candidate, require_surface_interest)
                 .unwrap_or(false)
+                && remote_agent_relay_supported(ssh, candidate)
             {
                 return Ok(PreparedRemoteHerdr {
                     remote_herdr: candidate.clone(),
@@ -1110,7 +1145,8 @@ pub(super) fn prepare_remote_herdr(
             ssh,
             &remote_herdr,
             require_surface_interest,
-        )? {
+        )? && remote_agent_relay_supported(ssh, &remote_herdr)
+        {
             return Ok(PreparedRemoteHerdr {
                 remote_herdr,
                 stop_after_install_approved: false,
@@ -1143,7 +1179,9 @@ pub(super) fn prepare_remote_herdr(
     source.cleanup();
     install_result?;
 
-    if !remote_binary_supports_endpoint_requirement(ssh, &remote_herdr, require_surface_interest)? {
+    if !remote_binary_supports_endpoint_requirement(ssh, &remote_herdr, require_surface_interest)?
+        || !remote_agent_relay_supported(ssh, &remote_herdr)
+    {
         return Err(io::Error::other(format!(
             "installed remote herdr at {}, but it does not support saved SSH endpoint federation",
             remote_herdr.executable.display()
@@ -1163,7 +1201,9 @@ pub(super) fn find_installed_remote_herdr(ssh: &RemoteSsh) -> io::Result<RemoteH
     let candidates = remote_binary_candidates(ssh, &remote_herdr)?;
     for mut candidate in candidates {
         if let Some(status) = remote_client_status(ssh, &candidate)? {
-            if status.supports_endpoint_requirement(&candidate.platform, true) {
+            if status.supports_endpoint_requirement(&candidate.platform, true)
+                && remote_agent_relay_supported(ssh, &candidate)
+            {
                 candidate.bridge_idle_timeout = status.remote_bridge_idle_timeout;
                 return Ok(candidate);
             }
@@ -1263,6 +1303,7 @@ pub(super) fn find_installed_remote_api_herdr(
         }
         if probe.status.success()
             && String::from_utf8_lossy(&probe.stdout).trim() == "herdr-api-bridge-v1"
+            && remote_agent_relay_supported(ssh, &candidate)
         {
             return Ok(candidate);
         }
@@ -2576,6 +2617,382 @@ impl Drop for SshStdioBridge {
     }
 }
 
+#[cfg(unix)]
+#[derive(Clone, PartialEq, Eq)]
+struct LocalAgentIdentity {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+enum LocalAgentError {
+    Missing,
+    Stale,
+}
+
+#[cfg(unix)]
+fn local_agent_identity() -> Result<LocalAgentIdentity, LocalAgentError> {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+
+    let path = std::env::var_os("SSH_AUTH_SOCK")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .ok_or(LocalAgentError::Missing)?;
+    let metadata = fs::metadata(&path).map_err(|_| LocalAgentError::Stale)?;
+    if !metadata.file_type().is_socket() || metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(LocalAgentError::Stale);
+    }
+    Ok(LocalAgentIdentity {
+        path,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(unix)]
+pub(super) struct SshAgentProvider {
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl SshAgentProvider {
+    pub(super) fn start(
+        ssh: &RemoteSsh,
+        remote_herdr: RemoteHerdr,
+        session_name: String,
+    ) -> Option<Self> {
+        if !ssh.forward_agent {
+            return None;
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let last_error = Arc::new(Mutex::new(Some(
+            "SSH agent provider bridge is connecting".to_owned(),
+        )));
+        let thread_stop = Arc::clone(&stop);
+        let thread_error = Arc::clone(&last_error);
+        let target = ssh.target.clone();
+        let options = ssh.options().cloned();
+        let thread = thread::spawn(move || {
+            run_agent_provider_loop(
+                &target,
+                &remote_herdr,
+                &session_name,
+                options.as_ref(),
+                &thread_stop,
+                &thread_error,
+            );
+        });
+        Some(Self {
+            stop,
+            thread: Some(thread),
+        })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SshAgentProvider {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn run_agent_provider_loop(
+    target: &str,
+    remote_herdr: &RemoteHerdr,
+    session_name: &str,
+    ssh_options: Option<&ManagedSshOptions>,
+    stop: &AtomicBool,
+    last_error: &Mutex<Option<String>>,
+) {
+    use std::io::BufRead as _;
+
+    const MAX_RETRY: Duration = Duration::from_secs(2);
+    let mut retry = Duration::from_millis(250);
+    while !stop.load(Ordering::Acquire) {
+        let identity = match local_agent_identity() {
+            Ok(identity) => identity,
+            Err(LocalAgentError::Missing) => {
+                set_agent_provider_error(
+                    last_error,
+                    Some("SSH agent forwarding enabled but no local agent is available".to_owned()),
+                );
+                sleep_until_retry(stop, retry);
+                retry = retry.saturating_mul(2).min(MAX_RETRY);
+                continue;
+            }
+            Err(LocalAgentError::Stale) => {
+                set_agent_provider_error(
+                    last_error,
+                    Some("local SSH agent socket became stale".to_owned()),
+                );
+                sleep_until_retry(stop, retry);
+                retry = retry.saturating_mul(2).min(MAX_RETRY);
+                continue;
+            }
+        };
+
+        let mut command = Command::new("ssh");
+        apply_managed_ssh_options(&mut command, ssh_options);
+        apply_bridge_liveness_options(&mut command);
+        command
+            .arg("-S")
+            .arg("none")
+            .args(["-o", "ControlMaster=no", "-o", "ControlPersist=no"])
+            .arg("-A")
+            .arg("-T")
+            .arg(target)
+            .arg(remote_internal_command(
+                remote_herdr,
+                session_name,
+                "remote-agent-provider",
+            ))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                set_agent_provider_error(
+                    last_error,
+                    Some(format!("SSH agent provider bridge disconnected: {error}")),
+                );
+                sleep_until_retry(stop, retry);
+                retry = retry.saturating_mul(2).min(MAX_RETRY);
+                continue;
+            }
+        };
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        if let Some(stdout) = child.stdout.take() {
+            thread::spawn(move || {
+                let mut line = String::new();
+                let result = std::io::BufReader::new(stdout).read_line(&mut line);
+                let _ = ready_tx.send(result.map(|_| line));
+            });
+        }
+        let stderr_reader = spawn_bridge_stderr_reader(child.stderr.take());
+        let mut ready = false;
+        let mut local_stale = false;
+        loop {
+            if stop.load(Ordering::Acquire) {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = join_bridge_stderr_reader(stderr_reader);
+                return;
+            }
+            if !matches!(local_agent_identity(), Ok(current) if current == identity) {
+                local_stale = true;
+                let _ = child.kill();
+            }
+            match ready_rx.try_recv() {
+                Ok(Ok(line)) if line.trim() == "ready" => {
+                    ready = true;
+                    retry = Duration::from_millis(250);
+                    set_agent_provider_error(last_error, None);
+                }
+                Ok(Ok(_)) | Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let stderr = join_bridge_stderr_reader(stderr_reader);
+                    let detail = String::from_utf8_lossy(&stderr).trim().to_owned();
+                    let message = if local_stale {
+                        "local SSH agent socket became stale; restarting provider".to_owned()
+                    } else if detail.contains("no forwarded SSH agent was supplied") {
+                        "SSH agent forwarding was not accepted by the remote host".to_owned()
+                    } else if detail.contains("remote stable SSH-agent endpoint unavailable") {
+                        "remote stable SSH-agent endpoint unavailable".to_owned()
+                    } else if detail.is_empty() {
+                        format!("SSH agent provider bridge disconnected: {status}")
+                    } else {
+                        tracing::debug!(%detail, "SSH agent provider exited");
+                        format!("SSH agent provider bridge disconnected: {status}")
+                    };
+                    set_agent_provider_error(last_error, Some(message));
+                    break;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = join_bridge_stderr_reader(stderr_reader);
+                    set_agent_provider_error(
+                        last_error,
+                        Some(format!("SSH agent provider bridge disconnected: {error}")),
+                    );
+                    break;
+                }
+            }
+            thread::sleep(if ready {
+                Duration::from_millis(250)
+            } else {
+                Duration::from_millis(50)
+            });
+        }
+        sleep_until_retry(stop, retry);
+        retry = retry.saturating_mul(2).min(MAX_RETRY);
+    }
+}
+
+#[cfg(unix)]
+fn sleep_until_retry(stop: &AtomicBool, delay: Duration) {
+    let deadline = Instant::now() + delay;
+    while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn set_agent_provider_error(slot: &Mutex<Option<String>>, error: Option<String>) {
+    let mut current = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if *current == error {
+        return;
+    }
+    match error.as_deref() {
+        Some(message) => tracing::warn!(%message, "SSH-agent forwarding unavailable"),
+        None => tracing::info!("SSH-agent forwarding recovered"),
+    }
+    *current = error;
+}
+
+fn spawn_bridge_stderr_reader(stderr: Option<std::process::ChildStderr>) -> JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut stderr) = stderr {
+            let _ = stderr.read_to_end(&mut bytes);
+        }
+        bytes
+    })
+}
+
+fn join_bridge_stderr_reader(reader: JoinHandle<Vec<u8>>) -> Vec<u8> {
+    reader.join().unwrap_or_default()
+}
+
+fn apply_bridge_liveness_options(command: &mut Command) {
+    command.args([
+        "-o",
+        "ServerAliveInterval=5",
+        "-o",
+        "ServerAliveCountMax=2",
+        "-o",
+        "TCPKeepAlive=yes",
+    ]);
+}
+
+fn remote_internal_command(
+    remote_herdr: &RemoteHerdr,
+    session_name: &str,
+    command: &str,
+) -> String {
+    remote_herdr
+        .executable
+        .session_command(session_name, &[command])
+}
+
+fn remote_agent_relay_supported(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) -> bool {
+    if !ssh.forward_agent {
+        return true;
+    }
+    let command = remote_internal_command(
+        remote_herdr,
+        &ssh.session_name,
+        "remote-agent-migration-status",
+    );
+    ssh.shell_output(&remote_herdr.platform, &command)
+        .is_ok_and(|output| {
+            output.status.success()
+                && matches!(
+                    String::from_utf8_lossy(&output.stdout).trim(),
+                    "needed" | "complete"
+                )
+        })
+}
+
+fn prepare_remote_agent_relay(
+    ssh: &RemoteSsh,
+    remote_herdr: &RemoteHerdr,
+    session_name: &str,
+) -> io::Result<bool> {
+    if !ssh.forward_agent {
+        tracing::debug!(target = %ssh.target(), "SSH agent forwarding disabled");
+        return Ok(false);
+    }
+    let command = remote_internal_command(remote_herdr, session_name, "remote-agent-prepare");
+    let output = ssh.shell_output(&remote_herdr.platform, &command)?;
+    if !output.status.success() {
+        return Err(command_failed(
+            "remote stable SSH-agent endpoint unavailable",
+            &output,
+        ));
+    }
+    let command =
+        remote_internal_command(remote_herdr, session_name, "remote-agent-migration-status");
+    let output = ssh.shell_output(&remote_herdr.platform, &command)?;
+    if !output.status.success() {
+        return Err(command_failed(
+            "could not determine remote SSH-agent migration status",
+            &output,
+        ));
+    }
+    match String::from_utf8_lossy(&output.stdout).trim() {
+        "needed" => Ok(true),
+        "complete" => Ok(false),
+        status => Err(io::Error::other(format!(
+            "invalid remote SSH-agent migration status: {status}"
+        ))),
+    }
+}
+
+fn ensure_remote_agent_relay_server(
+    ssh: &RemoteSsh,
+    remote_herdr: &RemoteHerdr,
+    session_name: &str,
+    migration_needed: bool,
+) -> io::Result<()> {
+    if !ssh.forward_agent || !migration_needed {
+        return Ok(());
+    }
+    let migrated_running_server = match remote_server_status(ssh, remote_herdr, false)? {
+        RemoteServerStatus::Running {
+            live_handoff: true, ..
+        } => {
+            live_handoff_remote_server(ssh, remote_herdr)?;
+            true
+        }
+        RemoteServerStatus::Running { .. } => {
+            return Err(io::Error::other(
+                "remote server requires a one-time restart to enable durable SSH-agent forwarding",
+            ));
+        }
+        RemoteServerStatus::NotRunning => false,
+    };
+    let command = remote_internal_command(
+        remote_herdr,
+        session_name,
+        "remote-agent-migration-complete",
+    );
+    let output = ssh.shell_output(&remote_herdr.platform, &command)?;
+    if !output.status.success() {
+        return Err(command_failed(
+            "could not complete remote SSH-agent migration",
+            &output,
+        ));
+    }
+    if migrated_running_server {
+        eprintln!(
+            "existing panes on {} retain their previous SSH_AUTH_SOCK; recreate each pane once or export the session's stable ssh-agent/agent.sock path in its shell",
+            ssh.target()
+        );
+    }
+    Ok(())
+}
+
 fn ssh_config_quote(path: &str) -> String {
     format!("\"{path}\"")
 }
@@ -2718,6 +3135,7 @@ fn bridge_connection(
     let upload_stop = Arc::new(BridgeUploadStop::new()?);
     let mut command = Command::new("ssh");
     apply_managed_ssh_options(&mut command, ssh_options);
+    command.arg("-a");
     if noninteractive {
         apply_noninteractive_ssh_options(&mut command);
     }

@@ -193,6 +193,8 @@ fn agent_panel_sort_from_config(
     match sort {
         crate::config::AgentPanelSortConfig::Spaces => state::AgentPanelSort::Spaces,
         crate::config::AgentPanelSortConfig::Priority => state::AgentPanelSort::Priority,
+        // Manual order is client presentation state; the server keeps its stable space order.
+        crate::config::AgentPanelSortConfig::Manual => state::AgentPanelSort::Spaces,
     }
 }
 

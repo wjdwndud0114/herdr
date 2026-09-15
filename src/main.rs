@@ -403,6 +403,10 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Set false to run plain ssh against your ssh config unchanged — this does not
 # force keepalive or multiplexing off, it only stops herdr from adding its own.
 # manage_ssh_config = true
+# Forward the local SSH agent through a stable, session-owned remote relay.
+# This is opt-in because remote processes can request signatures from it.
+# Herdr explicitly disables agent forwarding on normal SSH bridges.
+# forward_agent = false
 
 [experimental]
 # Allow launching herdr from inside a herdr-managed pane.
@@ -552,6 +556,25 @@ fn main() -> io::Result<()> {
     // Subcommands and flags (no TUI, no logging needed)
     if args.get(1).map(|s| s.as_str()) == Some("remote-client-bridge") {
         return remote::run_remote_client_bridge(&args[2..]);
+    }
+
+    if args.get(1).map(String::as_str) == Some("remote-agent-prepare") {
+        return remote::prepare_remote_agent_relay();
+    }
+    if args.get(1).map(String::as_str) == Some("remote-agent-disable") {
+        return remote::disable_remote_agent_relay();
+    }
+    if args.get(1).map(String::as_str) == Some("remote-agent-migration-status") {
+        return remote::print_remote_agent_server_migration_status();
+    }
+    if args.get(1).map(String::as_str) == Some("remote-agent-migration-complete") {
+        return remote::mark_remote_agent_server_migrated();
+    }
+    if args.get(1).map(String::as_str) == Some("remote-agent-provider") {
+        return remote::run_remote_agent_provider();
+    }
+    if args.get(1).map(String::as_str) == Some("remote-agent-relay-daemon") {
+        return remote::run_remote_agent_relay_daemon();
     }
 
     if args.get(1).map(|s| s.as_str()) == Some("server") {

@@ -7,9 +7,17 @@ pub(super) fn render_collapsed(
     endpoints: &[ClientShellEndpoint],
     active_endpoint_id: &ClientEndpointId,
     config: &ClientShellConfig,
+    pinned_agents: &HashSet<preferences::ClientAgentPreferenceKey>,
+    agent_manual_order: &[preferences::ClientAgentPreferenceKey],
     hits: &mut ShellHitMap,
 ) {
-    let rows = agent_rows(endpoints, active_endpoint_id, config);
+    let rows = agent_rows(
+        endpoints,
+        active_endpoint_id,
+        config,
+        pinned_agents,
+        agent_manual_order,
+    );
     for (index, row) in rows.into_iter().take(area.height as usize).enumerate() {
         let rect = Rect::new(area.x, area.y + index as u16, area.width, 1);
         if row.agent.focused {
@@ -50,6 +58,9 @@ pub(super) fn render_expanded(
     active_endpoint_id: &ClientEndpointId,
     config: &ClientShellConfig,
     agent_scroll: &mut usize,
+    pinned_agents: &HashSet<preferences::ClientAgentPreferenceKey>,
+    unread_agents: &HashSet<preferences::ClientAgentPreferenceKey>,
+    agent_manual_order: &[preferences::ClientAgentPreferenceKey],
     hits: &mut ShellHitMap,
 ) {
     if !super::agent_sidebar::render_agent_panel_header(
@@ -61,7 +72,13 @@ pub(super) fn render_expanded(
     ) {
         return;
     }
-    let rows = agent_rows(endpoints, active_endpoint_id, config);
+    let rows = agent_rows(
+        endpoints,
+        active_endpoint_id,
+        config,
+        pinned_agents,
+        agent_manual_order,
+    );
     super::agent_sidebar::render_agent_list(
         buffer,
         area,
@@ -73,6 +90,39 @@ pub(super) fn render_expanded(
         |row| row.agent.rows.len(),
         |buffer, rect, row, hits| {
             super::agent_sidebar::render_agent_row(buffer, rect, &row.agent, config);
+            let pin_rect = Rect::new(rect.right().saturating_sub(2), rect.y, 2.min(rect.width), 1);
+            let unread_rect =
+                Rect::new(rect.right().saturating_sub(4), rect.y, 2.min(rect.width), 1);
+            hits.agent_pins.push((pin_rect, row.key.clone()));
+            hits.agent_unreads.push((unread_rect, row.key.clone()));
+            put_text(
+                buffer,
+                unread_rect.right().saturating_sub(1),
+                unread_rect.y,
+                1,
+                if unread_agents.contains(&row.key) {
+                    "●"
+                } else {
+                    "○"
+                },
+                Style::default().fg(if unread_agents.contains(&row.key) {
+                    config.palette.accent
+                } else {
+                    config.palette.overlay0
+                }),
+            );
+            put_text(
+                buffer,
+                pin_rect.right().saturating_sub(1),
+                pin_rect.y,
+                1,
+                if row.pinned { "◆" } else { "◇" },
+                Style::default().fg(if row.pinned {
+                    config.palette.accent
+                } else {
+                    config.palette.overlay0
+                }),
+            );
             if row.stale {
                 buffer.set_style(
                     rect,
@@ -88,6 +138,8 @@ pub(super) fn render_expanded(
 }
 
 struct EndpointAgentRow {
+    key: preferences::ClientAgentPreferenceKey,
+    pinned: bool,
     endpoint_id: ClientEndpointId,
     machine_label: String,
     stale: bool,
@@ -98,6 +150,8 @@ fn agent_rows(
     endpoints: &[ClientShellEndpoint],
     active_endpoint_id: &ClientEndpointId,
     config: &ClientShellConfig,
+    pinned_agents: &HashSet<preferences::ClientAgentPreferenceKey>,
+    agent_manual_order: &[preferences::ClientAgentPreferenceKey],
 ) -> Vec<EndpointAgentRow> {
     let mut rendered_rows = endpoints
         .iter()
@@ -121,17 +175,25 @@ fn agent_rows(
         .flatten()
         .collect::<HashMap<_, _>>();
 
-    super::aggregate_navigation::aggregate_agent_rows(
+    super::aggregate_navigation::aggregate_agent_rows_with_preferences(
         endpoints,
         active_endpoint_id,
         config.agent_panel_sort,
+        pinned_agents,
+        agent_manual_order,
     )
     .into_iter()
     .filter_map(|row| {
         let key = (row.endpoint.endpoint_id.clone(), row.agent.pane_id.clone());
         let mut agent = rendered_rows.remove(&key)?;
         agent.focused &= row.endpoint.endpoint_id == active_endpoint_id;
+        let key = preferences::ClientAgentPreferenceKey::new(
+            row.endpoint.endpoint_id,
+            &row.agent.pane_id,
+        );
         Some(EndpointAgentRow {
+            pinned: pinned_agents.contains(&key),
+            key,
             endpoint_id: row.endpoint.endpoint_id.clone(),
             machine_label: row.endpoint.label.to_owned(),
             stale: row.endpoint.stale(),

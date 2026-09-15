@@ -1,3 +1,5 @@
+#[cfg(unix)]
+mod agent_relay_unix;
 mod args;
 mod attach;
 mod host;
@@ -5,6 +7,16 @@ mod process;
 mod restart_policy;
 mod saved;
 
+#[cfg(unix)]
+pub(crate) use agent_relay_unix::{
+    activate_server_environment as activate_remote_agent_environment,
+    apply_pane_environment as apply_remote_agent_pane_environment,
+    disable_relay as disable_remote_agent_relay,
+    mark_server_migrated as mark_remote_agent_server_migrated,
+    prepare_relay as prepare_remote_agent_relay,
+    print_server_migration_status as print_remote_agent_server_migration_status,
+    run_provider as run_remote_agent_provider, run_relay_daemon as run_remote_agent_relay_daemon,
+};
 pub(crate) use args::*;
 pub(crate) use attach::*;
 pub(crate) use host::run_remote_client_bridge;
@@ -34,6 +46,48 @@ pub(crate) fn run_remote_api_bridge(args: &[String]) -> std::io::Result<()> {
             "usage: herdr remote-api-bridge [--check]",
         )),
     }
+}
+
+#[cfg(windows)]
+pub(crate) fn prepare_remote_agent_relay() -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "remote SSH-agent relays require a Unix remote host",
+    ))
+}
+
+#[cfg(windows)]
+pub(crate) fn disable_remote_agent_relay() -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "remote SSH-agent relays require a Unix remote host",
+    ))
+}
+
+#[cfg(windows)]
+pub(crate) fn print_remote_agent_server_migration_status() -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "remote SSH-agent relays require a Unix remote host",
+    ))
+}
+
+#[cfg(windows)]
+pub(crate) fn mark_remote_agent_server_migrated() -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "remote SSH-agent relays require a Unix remote host",
+    ))
+}
+
+#[cfg(windows)]
+pub(crate) fn run_remote_agent_provider() -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "remote SSH-agent relays require a Unix remote host",
+    ))
+}
+
+#[cfg(windows)]
+pub(crate) fn run_remote_agent_relay_daemon() -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "remote SSH-agent relays require a Unix remote host",
+    ))
 }
 
 pub(crate) fn print_saved_ssh_error_hint(err: &std::io::Error, target: &str) {

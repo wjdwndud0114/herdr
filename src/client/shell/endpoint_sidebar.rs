@@ -192,6 +192,8 @@ pub(super) fn render_collapsed(
         state.endpoints,
         state.active_endpoint_id,
         config,
+        state.pinned_agents,
+        state.agent_manual_order,
         hits,
     );
     hits.sidebar_toggle = if area.is_empty() || workspace_area.width == 0 {
@@ -542,6 +544,9 @@ pub(super) fn render_expanded(
         state.active_endpoint_id,
         config,
         state.agent_scroll,
+        state.pinned_agents,
+        state.unread_agents,
+        state.agent_manual_order,
         hits,
     );
     hits.sidebar_toggle = Rect::new(

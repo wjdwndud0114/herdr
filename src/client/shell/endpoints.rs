@@ -608,6 +608,10 @@ impl ClientShellState {
                 endpoint.agent_view_projection = None;
             }
         }
+        if self.prune_agent_preferences_for_endpoint(endpoint_id) {
+            let mut outcome = ClientShellInput::default();
+            self.persist_chrome_preferences(&mut outcome);
+        }
     }
 
     pub(crate) fn acknowledge_active_surface_agents(&mut self, surface: &PaneSurfaceFrame) -> bool {
