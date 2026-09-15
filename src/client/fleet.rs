@@ -26,6 +26,8 @@ const FLEET_INSTANCE_TOKEN: &str = "fleet_instance";
 const ENDPOINT_WRITE_QUEUE_CAPACITY: usize = 256;
 const RETRY_INITIAL: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(30);
+const CODER_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+const CODER_STATUS_POLL: Duration = Duration::from_millis(50);
 
 pub(super) fn is_enabled() -> bool {
     crate::fleet::load().enabled_instances().next().is_some()
@@ -576,11 +578,44 @@ fn coder_workspace_name(target: &str) -> Option<&str> {
 
 fn check_coder_workspace(workspace: &str) -> CoderWorkspaceStatus {
     let search = format!("owner:me name:{workspace}");
-    let output = Command::new("coder")
+    let child = Command::new("coder")
         .args(["list", "--search", &search, "--output", "json"])
         .stdin(Stdio::null())
-        .output();
-    let output = match output {
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(error) => {
+            return CoderWorkspaceStatus::Unavailable(format!(
+                "could not run Coder status check: {error}"
+            ));
+        }
+    };
+    let deadline = Instant::now() + CODER_STATUS_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(CODER_STATUS_POLL);
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return CoderWorkspaceStatus::Unavailable(
+                    "Coder status check timed out; waiting for network".to_owned(),
+                );
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return CoderWorkspaceStatus::Unavailable(format!(
+                    "Coder status check failed: {error}"
+                ));
+            }
+        }
+    }
+    let output = match child.wait_with_output() {
         Ok(output) if output.status.success() => output,
         Ok(_) => {
             return CoderWorkspaceStatus::Unavailable(
@@ -854,18 +889,22 @@ fn handle_client_message(state: &mut State, message: ClientMessage) -> io::Resul
             match rewrite_request(state, &request) {
                 Ok((index, request)) => {
                     switch_active(state, index)?;
-                    let Some(boot_id) = state.endpoints[index]
+                    let Some(endpoint_boot_id) = state.endpoints[index]
                         .snapshot
                         .as_deref()
                         .map(|snapshot| snapshot.boot_id.clone())
                     else {
                         show_error(state, index)?;
+                        complete_unavailable_request(state, boot_id, &request, index)?;
                         return Ok(false);
                     };
                     send_to(
                         state,
                         index,
-                        &ClientMessage::ClientShellEndpointRequest { boot_id, request },
+                        &ClientMessage::ClientShellEndpointRequest {
+                            boot_id: endpoint_boot_id,
+                            request,
+                        },
                     )?;
                 }
                 Err(index) => {
