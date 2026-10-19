@@ -76,6 +76,13 @@ fn usable_socket(path: &Path) -> bool {
     fingerprint(path).is_some()
 }
 
+fn pinned_socket_path(path: PathBuf) -> PathBuf {
+    fs::canonicalize(&path)
+        .ok()
+        .filter(|resolved| std::os::unix::net::SocketAddr::from_pathname(resolved).is_ok())
+        .unwrap_or(path)
+}
+
 // A listener that dies in place, or an in-place change that keeps all of these fields, is
 // noticed only at the next selection; periodic connect probes would cost a forwarded channel.
 fn fingerprint(path: &Path) -> Option<Fingerprint> {
@@ -125,8 +132,13 @@ impl SshAgentRegistry {
         // A handoff keeps existing pane environments, including this stable pathname.
         let fallback = fs::read_link(&path)
             .ok()
+            .map(pinned_socket_path)
             .filter(|target| target != &path && usable_socket(target))
-            .or_else(|| inherited.filter(|target| target != &path && usable_socket(target)));
+            .or_else(|| {
+                inherited
+                    .map(pinned_socket_path)
+                    .filter(|target| target != &path && usable_socket(target))
+            });
         let mut state = State {
             path,
             fallback,
@@ -155,7 +167,14 @@ impl SshAgentRegistry {
                 "SSH agent must be an absolute, user-owned socket",
             ));
         }
-        // Canonicalizing /var to /private/var can exceed macOS's Unix socket path limit.
+        // A Coder connection can expose its socket through an alias shared with other connections.
+        let path = pinned_socket_path(path);
+        if !usable_socket(&path) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SSH agent socket is unavailable",
+            ));
+        }
         let id = state.next_id;
         state.next_id += 1;
         state.agents.push((id, path));
