@@ -260,6 +260,66 @@ impl crate::agent_view_eval::AgentViewEntry for ClientAgentViewEntry<'_> {
     }
 }
 
+pub(super) fn aggregate_agent_rows_with_preferences<'a>(
+    endpoints: &'a [ClientShellEndpoint],
+    active_endpoint_id: &ClientEndpointId,
+    sort: crate::config::AgentPanelSortConfig,
+    pinned: &HashSet<super::preferences::ClientAgentPreferenceKey>,
+    manual_order: &[super::preferences::ClientAgentPreferenceKey],
+) -> Vec<AggregateAgentRow<'a>> {
+    let rows = aggregate_agent_rows(endpoints, active_endpoint_id, sort);
+    if pinned.is_empty()
+        && (sort != crate::config::AgentPanelSortConfig::Manual || manual_order.is_empty())
+    {
+        return rows;
+    }
+    let ranks = if sort == crate::config::AgentPanelSortConfig::Manual {
+        manual_order
+            .iter()
+            .enumerate()
+            .map(|(index, key)| (key, index))
+            .collect::<HashMap<_, _>>()
+    } else {
+        HashMap::new()
+    };
+    let mut decorated = rows
+        .into_iter()
+        .enumerate()
+        .map(|(base_index, row)| {
+            let key = super::preferences::ClientAgentPreferenceKey::new(
+                row.endpoint.endpoint_id,
+                &row.agent.pane_id,
+            );
+            let rank = if sort == crate::config::AgentPanelSortConfig::Manual {
+                ranks.get(&key).copied().unwrap_or(usize::MAX)
+            } else {
+                0
+            };
+            ((!pinned.contains(&key), rank, base_index), row)
+        })
+        .collect::<Vec<_>>();
+    decorated.sort_by_key(|(key, _)| *key);
+    decorated.into_iter().map(|(_, row)| row).collect()
+}
+
+pub(super) fn online_agent_targets_with_preferences(
+    endpoints: &[ClientShellEndpoint],
+    active_endpoint_id: &ClientEndpointId,
+    sort: crate::config::AgentPanelSortConfig,
+    pinned: &HashSet<super::preferences::ClientAgentPreferenceKey>,
+    manual_order: &[super::preferences::ClientAgentPreferenceKey],
+) -> Vec<AggregateAgentTarget> {
+    aggregate_agent_rows_with_preferences(endpoints, active_endpoint_id, sort, pinned, manual_order)
+        .into_iter()
+        .filter(|row| !row.endpoint.stale())
+        .map(|row| AggregateAgentTarget {
+            endpoint_id: row.endpoint.endpoint_id.clone(),
+            pane_id: row.agent.pane_id.clone(),
+        })
+        .collect()
+}
+
+#[cfg(test)]
 pub(super) fn online_agent_targets(
     endpoints: &[ClientShellEndpoint],
     active_endpoint_id: &ClientEndpointId,

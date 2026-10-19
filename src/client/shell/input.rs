@@ -995,10 +995,12 @@ impl ClientShellState {
                 })
                 .is_some(),
             KeybindMatch::Action(KeybindAction::FocusAgent(index)) => {
-                super::aggregate_navigation::online_agent_targets(
+                super::aggregate_navigation::online_agent_targets_with_preferences(
                     &self.endpoints,
                     &self.active_endpoint_id,
                     self.config.agent_panel_sort,
+                    &self.pinned_agents,
+                    &self.agent_manual_order,
                 )
                 .get(*index)
                 .is_some()

@@ -49,6 +49,7 @@ pub(super) fn ordered_agent_pane_ids(
         .collect()
 }
 
+#[cfg(test)]
 pub(super) fn render_agent_panel(
     buffer: &mut Buffer,
     area: Rect,
@@ -121,6 +122,7 @@ pub(super) fn render_agent_panel_header(
     let sort_label = agent_view_label.unwrap_or(match config.agent_panel_sort {
         crate::config::AgentPanelSortConfig::Spaces => "grouped",
         crate::config::AgentPanelSortConfig::Priority => "priority",
+        crate::config::AgentPanelSortConfig::Manual => "manual",
     });
     let sort_width = display_width(sort_label).min(area.width as usize) as u16;
     let sort_rect = Rect::new(
@@ -234,6 +236,7 @@ pub(super) fn render_agent_list<T>(
     }
 }
 
+#[cfg(test)]
 pub(super) fn agent_rows(
     snapshot: &ClientShellSnapshot,
     config: &ClientShellConfig,

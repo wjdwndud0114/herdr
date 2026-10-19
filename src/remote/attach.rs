@@ -1406,6 +1406,8 @@ fn apply_noninteractive_ssh_options(command: &mut Command) {
         .arg("-o")
         .arg("NumberOfPasswordPrompts=0")
         .arg("-o")
+        .arg("UserKnownHostsFile=~/.ssh/known_hosts")
+        .arg("-o")
         .arg("StrictHostKeyChecking=yes")
         .arg("-o")
         .arg("ConnectTimeout=10")
@@ -1418,6 +1420,13 @@ fn apply_noninteractive_ssh_options(command: &mut Command) {
 }
 
 fn apply_managed_ssh_options(command: &mut Command, options: Option<&ManagedSshOptions>) {
+    command.arg(
+        if crate::config::Config::load().config.remote.forward_agent {
+            "-A"
+        } else {
+            "-a"
+        },
+    );
     // Compress the first connection too: multiplexed bridges inherit the master's transport.
     command.arg("-C");
     let Some(options) = options else {

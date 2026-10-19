@@ -16,6 +16,42 @@ pub(super) fn merged_config_diagnostic(
 }
 
 impl ClientShellState {
+    pub(super) fn prune_agent_preferences_for_endpoint(
+        &mut self,
+        endpoint_id: &ClientEndpointId,
+    ) -> bool {
+        let Some(snapshot) = self
+            .endpoints
+            .iter()
+            .find(|endpoint| &endpoint.endpoint_id == endpoint_id)
+            .and_then(|endpoint| endpoint.snapshot.as_deref())
+        else {
+            return false;
+        };
+        let active = snapshot
+            .panes
+            .iter()
+            .map(|pane| pane.pane_id.as_str())
+            .collect::<HashSet<_>>();
+        let mut changed = false;
+        self.pinned_agents.retain(|key| {
+            let keep = &key.endpoint_id != endpoint_id || active.contains(key.pane_id.as_str());
+            changed |= !keep;
+            keep
+        });
+        self.unread_agents.retain(|key| {
+            let keep = &key.endpoint_id != endpoint_id || active.contains(key.pane_id.as_str());
+            changed |= !keep;
+            keep
+        });
+        self.agent_manual_order.retain(|key| {
+            let keep = &key.endpoint_id != endpoint_id || active.contains(key.pane_id.as_str());
+            changed |= !keep;
+            keep
+        });
+        changed
+    }
+
     pub(super) fn set_local_config_diagnostic(&mut self, diagnostic: Option<String>) {
         self.local_config_diagnostic = diagnostic;
         self.config_diagnostic = merged_config_diagnostic(
@@ -48,6 +84,10 @@ impl ClientShellState {
             })
             .collect::<Vec<_>>();
         remote_collapsed_groups.sort_by(|left, right| left.profile_id.cmp(&right.profile_id));
+        let mut pinned_agents = self.pinned_agents.iter().cloned().collect::<Vec<_>>();
+        pinned_agents.sort();
+        let mut unread_agents = self.unread_agents.iter().cloned().collect::<Vec<_>>();
+        unread_agents.sort();
         let preferences = preferences::ClientChromePreferences {
             sidebar_width: self.sidebar_width_manual.then_some(self.sidebar_width),
             sidebar_section_split: self
@@ -61,6 +101,9 @@ impl ClientShellState {
                 .then_some(self.config.agent_panel_sort),
             collapsed_groups,
             remote_collapsed_groups,
+            pinned_agents,
+            unread_agents,
+            agent_manual_order: self.agent_manual_order.clone(),
         };
         if let Err(error) = preferences::store(path, preferences) {
             self.set_endpoint_error(error);

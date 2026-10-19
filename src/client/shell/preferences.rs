@@ -7,6 +7,24 @@ static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(1);
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+pub(super) struct ClientAgentPreferenceKey {
+    pub(super) endpoint_id: crate::client::endpoint::ClientEndpointId,
+    pub(super) pane_id: String,
+}
+
+impl ClientAgentPreferenceKey {
+    pub(super) fn new(
+        endpoint_id: &crate::client::endpoint::ClientEndpointId,
+        pane_id: &str,
+    ) -> Self {
+        Self {
+            endpoint_id: endpoint_id.clone(),
+            pane_id: pane_id.to_owned(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct ClientRemoteCollapsedGroups {
     pub(super) profile_id: String,
@@ -28,6 +46,12 @@ pub(super) struct ClientChromePreferences {
     pub(super) collapsed_groups: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) remote_collapsed_groups: Vec<ClientRemoteCollapsedGroups>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) pinned_agents: Vec<ClientAgentPreferenceKey>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) unread_agents: Vec<ClientAgentPreferenceKey>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) agent_manual_order: Vec<ClientAgentPreferenceKey>,
 }
 
 pub(super) fn path_for_local_endpoint(socket_path: &Path) -> PathBuf {

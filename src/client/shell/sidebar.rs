@@ -50,6 +50,7 @@ pub(crate) fn render_collapsed_sidebar(
     snapshot: &ClientShellSnapshot,
     config: &ClientShellConfig,
     selected_workspace_id: Option<&str>,
+    ordered_agents: &[String],
     hits: &mut ShellHitMap,
 ) {
     let palette = &config.palette;
@@ -127,8 +128,9 @@ pub(crate) fn render_collapsed_sidebar(
         detail_area.width,
         detail_area.height.saturating_sub(1),
     );
-    for (index, pane_id) in super::ordered_agent_pane_ids(snapshot, config.agent_panel_sort)
-        .into_iter()
+    for (index, pane_id) in ordered_agents
+        .iter()
+        .cloned()
         .take(detail_content.height as usize)
         .enumerate()
     {
@@ -430,12 +432,17 @@ pub(crate) fn render_sidebar(
         }
     }
 
-    super::render_agent_panel(
+    super::endpoint_agents::render_expanded(
         buffer,
         detail_area,
-        snapshot,
+        snapshot.agent_view_label.as_deref(),
+        state.endpoints,
+        state.active_endpoint_id,
         config,
         state.agent_scroll,
+        state.pinned_agents,
+        state.unread_agents,
+        state.agent_manual_order,
         hits,
     );
 

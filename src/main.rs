@@ -411,6 +411,9 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Set false to run plain ssh against your ssh config unchanged — this does not
 # force keepalive or multiplexing off, it only stops herdr from adding its own.
 # manage_ssh_config = true
+# Explicitly forward your local SSH agent to saved machines through SSH.
+# Remote panes use upstream's stable, session-owned agent address.
+# forward_agent = false
 
 [experimental]
 # Allow launching herdr from inside a herdr-managed pane.

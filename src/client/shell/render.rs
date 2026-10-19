@@ -7,7 +7,10 @@ pub(in crate::client::shell) mod sidebar;
 #[path = "../shell/tabs.rs"]
 mod tabs;
 
-pub(super) use super::agent_sidebar::{ordered_agent_pane_ids, render_agent_panel};
+#[cfg(test)]
+pub(super) use super::agent_sidebar::ordered_agent_pane_ids;
+#[cfg(test)]
+pub(super) use super::agent_sidebar::render_agent_panel;
 pub(super) use super::aggregate_navigation::navigator_rows as client_navigator_rows;
 pub(super) use overlays::{render_client_overlay, render_context_menu, render_global_menu};
 pub(super) use sidebar::{render_collapsed_sidebar, render_sidebar, workspace_entries};
@@ -236,6 +239,9 @@ pub(super) struct ShellRenderState<'a> {
     pub(super) collapsed_endpoints: &'a HashSet<ClientEndpointId>,
     pub(super) collapsed_groups: &'a HashSet<String>,
     pub(super) remote_collapsed_groups: &'a HashMap<ClientEndpointId, HashSet<String>>,
+    pub(super) pinned_agents: &'a HashSet<preferences::ClientAgentPreferenceKey>,
+    pub(super) unread_agents: &'a HashSet<preferences::ClientAgentPreferenceKey>,
+    pub(super) agent_manual_order: &'a [preferences::ClientAgentPreferenceKey],
     pub(super) workspace_scroll: &'a mut usize,
     pub(super) agent_scroll: &'a mut usize,
     pub(super) tab_scroll: &'a mut usize,
@@ -288,6 +294,17 @@ pub(super) fn render_shell(
                 );
             }
         } else if state.sidebar_collapsed {
+            let ordered_agents =
+                super::aggregate_navigation::aggregate_agent_rows_with_preferences(
+                    state.endpoints,
+                    state.active_endpoint_id,
+                    config.agent_panel_sort,
+                    state.pinned_agents,
+                    state.agent_manual_order,
+                )
+                .into_iter()
+                .map(|row| row.agent.pane_id.clone())
+                .collect::<Vec<_>>();
             render_collapsed_sidebar(
                 buffer,
                 layout.sidebar,
@@ -296,6 +313,7 @@ pub(super) fn render_shell(
                 state
                     .selected_workspace_id
                     .map(|target| target.workspace_id.as_str()),
+                &ordered_agents,
                 &mut hits,
             );
         } else {
@@ -332,6 +350,8 @@ pub(super) fn render_shell(
         hits.workspaces.clear();
         hits.agents.clear();
         hits.endpoint_agents.clear();
+        hits.agent_pins.clear();
+        hits.agent_unreads.clear();
         hits.tab_scroll_left = Rect::default();
         hits.tab_scroll_right = Rect::default();
         hits.new_tab = Rect::default();

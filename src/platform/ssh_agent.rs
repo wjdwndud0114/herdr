@@ -39,7 +39,31 @@ pub(crate) struct SshAgentLease {
 }
 
 pub(crate) fn socket_path() -> PathBuf {
-    agent_path_for(&crate::api::socket_path())
+    let api_path = crate::api::socket_path();
+    legacy_socket_path(&api_path).unwrap_or_else(|| agent_path_for(&api_path))
+}
+
+fn legacy_socket_path(api_path: &Path) -> Option<PathBuf> {
+    let directory = api_path.parent()?.join("ssh-agent");
+    let owner = unsafe { libc::geteuid() };
+    let metadata = fs::symlink_metadata(&directory).ok()?;
+    if !metadata.is_dir() || metadata.uid() != owner || metadata.mode() & 0o077 != 0 {
+        return None;
+    }
+    let marker = fs::symlink_metadata(directory.join("enabled")).ok()?;
+    if !marker.is_file() || marker.uid() != owner || marker.mode() & 0o077 != 0 {
+        return None;
+    }
+    let path = directory.join("agent.sock");
+    match fs::symlink_metadata(&path) {
+        Ok(metadata)
+            if metadata.uid() == owner
+                && (metadata.file_type().is_socket() || metadata.file_type().is_symlink()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        _ => return None,
+    }
+    // Existing shells retain this pathname across handoff; the upstream registry takes ownership.
+    Some(path)
 }
 
 fn agent_path_for(api_path: &Path) -> PathBuf {
@@ -96,6 +120,7 @@ impl SshAgentRegistry {
     pub(crate) fn new(path: PathBuf, inherited: Option<PathBuf>) -> io::Result<Self> {
         let inherited = inherited.filter(|path| !path.as_os_str().is_empty());
         let managed = inherited.is_some()
+            || legacy_socket_path(&crate::api::socket_path()).as_ref() == Some(&path)
             || fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink());
         // A handoff keeps existing pane environments, including this stable pathname.
         let fallback = fs::read_link(&path)

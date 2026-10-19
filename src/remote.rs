@@ -15,6 +15,8 @@ pub(crate) use saved::*;
 pub(crate) fn run_remote_api_bridge(args: &[String]) -> std::io::Result<()> {
     match args {
         [] => {
+            #[cfg(unix)]
+            let _ssh_agent = ssh_agent::Registration::start();
             let path = crate::api::socket_path();
             let stream = crate::ipc::connect_local_stream(&path).map_err(|error| {
                 std::io::Error::new(

@@ -9,6 +9,23 @@ Each machine keeps its own Herdr server, sessions, and running processes. A lost
 
 Herdr requests SSH compression to reduce screen-update traffic on limited connections. This works with older compatible Herdr servers and does not change how typing or other input is delivered. Herdr's `-C` option overrides `Compression no` in your SSH config. If SSH reuses an existing connection through an external ControlMaster, that connection keeps its original compression setting.
 
+### Agent forwarding in this custom build
+
+This custom build supports explicit agent forwarding in `config.toml`:
+
+```toml
+[remote]
+forward_agent = true
+```
+
+Forwarding is disabled by default. When enabled, Herdr requests it explicitly for its SSH connections; the remote server's agent registry keeps a stable address for pane processes and tracks each bridge independently. Saved connections use `~/.ssh/known_hosts` with strict host-key verification, including Coder aliases whose generated SSH configuration normally discards host keys. Enroll each trusted machine's host key there before adding it.
+
+Sessions upgraded from the custom relay keep their private `ssh-agent/agent.sock` pathname, so existing shells using that address recover when a fresh bridge registers. The upstream registry owns this address after upgrade; a separate custom relay daemon is no longer needed. Shells with an older ephemeral `/tmp/ssh-*/agent.*` environment still need a one-time shell export or recreation.
+
+### Agent triage in this custom build
+
+Click `◇` to pin an agent (`◆`), or `○` to leave an unread reminder (`●`). Click the marker again to clear it. Pins sort ahead of other agents. Drag agent rows to set manual ordering; the panel's sort control cycles through grouped, priority, and manual. These preferences survive client restarts, use machine and pane identities, and are removed when the pane is removed. They also remain available while a machine is disconnected.
+
 ### Recovering SSH authentication
 
 On Linux and macOS clients, when `remote.manage_ssh_config=true`, Herdr shares an approved OpenSSH connection across machine add, the sidebar, and saved-machine API commands. Run `herdr machine status [<label-or-id>] [--json]` for fresh, noninteractive checks. **Reachable** means the remote Herdr server is available now, not that every open TUI is connected. Run `herdr machine reconnect <label-or-id>` in a terminal to complete native SSH authentication and verify the saved machine. It does not install or update Herdr. Open clients recheck failed connections within 30 seconds; no restart is needed. Clicking **`! auth`**, **`! error`**, or a reconnecting status retries the connection; if it fails, a notice shows the latest error and relevant CLI command. It never opens a credential popup.
